@@ -1,41 +1,48 @@
 /**
  * QA Field Report generator
- * - Finds the response sheet: Quality Assurance Process (Internal) > Internal QA Audits > "Technician Quality Inspection Form (Responses)"
- * - Writes "N/A" to blank answers
- * - Groups by Technician (col C) and Date (col A, date-only)
- * - Creates 1 Doc per (Technician, Date) in ".../QA Field Reports/Auto Reports"
- * - Skips creating if a Doc with the same name already exists in destination
- *
- * Required Scopes: DriveApp, SpreadsheetApp, DocumentApp, Utilities
+ * - Runs only when Convert To Docs!A2 is TRUE, then resets it to FALSE
+ * - Title: normal paragraph, bold 18, no indent, no spacing-before (flush-left)
+ * - Body text: 11 pt everywhere
+ * - Key Summary Findings: bold header (11) + blank lines; forced to last page
+ * - Location #: prefers trailing " space + digits " (e.g., "... 1686795"), falls back to legacy formats
+ * - Removes "Name and account Number"
+ * - Auditor from header (works with your new column B)
+ * - De-dupes by sanitized filename "QA Field Report - [Technician] [M-d-yy]"
  */
 
 const CONFIG = {
   timezone: 'America/Chicago',
-  // Folder path to the source spreadsheet (where the response Sheet lives)
+
+  // Folder & spreadsheet
   sourcePath: [
     'Quality Assurance Process (Internal)',
     'Internal QA Audits'
   ],
-  sourceSheetName: 'Technician Quality Inspection Form (Responses)', // Spreadsheet file name
-  // Destination folder path for the generated Docs
+  sourceSheetName: 'Technician Quality Inspection Form (Responses)',
+
+  // Output folder
   destinationPath: [
     'Quality Assurance Process (Internal)',
     'Internal QA Audits',
     'QA Field Reports',
     'Auto Reports'
   ],
-  // Columns (header names) we try to map from the sheet → report labels
-  // The keys are labels we render; the values are candidate header names in the Sheet.
+
+  // Checkbox gate (A2 per your note)
+  convertSheetName: 'Convert To Docs',
+  convertFlagRangeA1: 'A2',
+
+  // Top metadata fields (plain lines)
   fieldMap: {
     'Audit Date': ['Timestamp', 'Audit Date', 'Date'],
     'Location #': ['Location #', 'Location', 'Account #', 'Account Number'],
-    'Type Of Service': ['Type Of Service', 'Service Type'],
+    'Type Of Service': ['Type of Service', 'Type Of Service', 'Service Type'],
     'Auditor': ['Auditor', 'Audited By'],
-    'Technician': ['Technician', 'Technician Name', 'Employee'],
-    'Email': ['Email', 'Technician Email', 'Contact Email'],
-    'Name and account Number': ['Name and account Number', 'Customer Name', 'Account Name']
+    'Technician': ['Technician Name', 'Technician', 'Employee'],
+    'Email': ['Email Address', 'Email', 'Technician Email', 'Contact Email']
   },
-  // Ratings blocks to try in order—use any that exist in the sheet
+
+  // Ratings shown; values found via fuzzy matching of long form headers
   ratingsOrder: [
     'Notes & Product Use',
     'Exterior Condition',
@@ -47,292 +54,433 @@ const CONFIG = {
     'Paperwork Accuracy',
     'Customer Service'
   ],
-  // Free text sections to look for (best-effort—use whichever headers exist)
-  narrativeSections: {
-    'Observations & Recommendations': ['Observations & Recommendations', 'Observations', 'Recommendations', 'Notes', 'Comments'],
+
+  ratingMatchers: {
+    'Notes & Product Use': [
+      /notes.*products/i, /service ticket/i, /appropriate use of products/i
+    ],
+    'Exterior Condition': [
+      /exterior/i, /web presence/i, /wasp/i, /appropriate service/i
+    ],
+    'Equipment Condition': [
+      /equipment.*clean/i, /good working order/i, /operable|secure/i
+    ],
+    'Product Application': [
+      /products that were used/i, /according to the label/i, /company policy/i
+    ],
+    'Exclusion Efforts': [
+      /current rodent issues/i, /prohibits rodent entry/i, /exclusion/i
+    ],
+    'Interior Rodent Efforts': [
+      /rodent prevention efforts/i
+    ],
+    'Interior Pest Control': [
+      /general pest control.*inside/i, /on the inside of the structure/i
+    ],
+    'Paperwork Accuracy': [
+      /paperwork accuracy/i, /data inputs.*correct/i
+    ],
+    'Customer Service': [
+      /Interview the customer/i, /Customer Service/i, /Rate .*Customer Service/i
+    ]
   },
-  keyFindingsSections: [
+
+  // Key Summary Findings labels
+  keyFindingsLabels: [
     'Documentation',
     'Equipment Servicing',
     'Exterior Maintenance',
     'Customer Communication'
   ],
-  // Column positions (A/C) used for grouping if headers are odd:
+
+  // Fallbacks (header matching is used first)
   fallbackColumns: {
-    dateColIndex1Based: 1,         // Column A
-    techColIndex1Based: 3          // Column C
+    dateColIndex1Based: 1, // A
+    techColIndex1Based: 3  // C
   }
 };
 
+/**
+ * INSTALLABLE TRIGGER: From spreadsheet → On edit → onEditWatcher
+ * Reacts only to Convert To Docs!A2 edits. Always flips back to FALSE.
+ */
+function onEditWatcher(e) {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.tryLock(30000);
+
+    if (!e || !e.range) return;
+    var sheet = e.range.getSheet();
+    if (sheet.getName() !== CONFIG.convertSheetName) return;
+    if (e.range.getA1Notation() !== CONFIG.convertFlagRangeA1) return;
+
+    // Only run when box changed to TRUE
+    var newVal = (typeof e.value !== 'undefined') ? e.value : String(e.range.getValue());
+    var isTrue = (newVal === true) || (String(newVal).toUpperCase() === 'TRUE');
+    if (!isTrue) return;
+
+    Logger.log('Checkbox TRUE detected — starting report generation…');
+    runQaReportGeneration();
+    Logger.log('Report generation finished.');
+
+  } catch (err) {
+    Logger.log('onEditWatcher error: ' + (err && err.stack ? err.stack : err));
+  } finally {
+    // Always uncheck, even on error
+    try {
+      var ss = (e && e.source) ? e.source : SpreadsheetApp.getActiveSpreadsheet();
+      var tab = ss.getSheetByName(CONFIG.convertSheetName);
+      if (tab) tab.getRange(CONFIG.convertFlagRangeA1).setValue(false);
+      SpreadsheetApp.flush();
+      Logger.log('Checkbox reset to FALSE.');
+    } catch (err2) {
+      Logger.log('Failed to reset checkbox: ' + err2);
+    }
+    try { lock.releaseLock(); } catch (_) {}
+  }
+}
+
+/**
+ * Main generator.
+ * NOTE: Because the script is container-bound now, we use the active spreadsheet.
+ * (locateSpreadsheet_ remains available if you ever move back to a standalone project.)
+ */
 function runQaReportGeneration() {
-  const srcFolder = getFolderByPath_(CONFIG.sourcePath);
-  if (!srcFolder) throw new Error('Source base folder not found: ' + CONFIG.sourcePath.join(' / '));
+  // Use the sheet this script is bound to
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
 
-  const ssFile = getFileByNameInFolder_(srcFolder, CONFIG.sourceSheetName);
-  if (!ssFile) throw new Error('Spreadsheet not found in source folder: ' + CONFIG.sourceSheetName);
-
-  const ss = SpreadsheetApp.openById(ssFile.getId());
-  const sheet = pickLikelyFormSheet_(ss); // handles "Form Responses 1" or the only sheet present
+  // Work off the responses tab
+  const sheet = pickLikelyFormSheet_(ss);
   const data = getSheetDataWithHeaders_(sheet);
-  if (data.rows.length === 0) {
-    Logger.log('No rows to process.');
+  if (!data.rows.length) {
+    Logger.log('No rows.');
     return;
   }
 
-  // Normalize blanks to "N/A" in memory and write back where needed.
-  const writeBackRanges = fillBlanksWithNA_(sheet, data);
-  if (writeBackRanges.length) {
-    const range = sheet.getRange(2, 1, data.rows.length, data.headers.length);
-    range.setValues(data.rows); // commit "N/A" fills
+  // Fill blanks with "N/A" (except timestamp) and write back
+  const changed = fillBlanksWithNA_(data);
+  if (changed) {
+    sheet.getRange(2, 1, data.rows.length, data.headers.length).setValues(data.rows);
   }
 
   // Group by (Technician, Date-only)
   const groups = groupRowsByTechAndDate_(data);
 
-  // Destination folder
+  // Destination
   const destFolder = ensureFolderPath_(CONFIG.destinationPath);
-  if (!destFolder) throw new Error('Destination path missing and could not be created.');
+  if (!destFolder) throw new Error('Destination path could not be created.');
 
-  // Build docs
-  groups.forEach(group => {
-    const docName = buildDocName_(group.tech, group.date);
+  // Create reports
+  groups.forEach(function(group) {
+    const rawName = 'QA Field Report - ' + group.tech + ' ' + group.date;
+    const docName = filenameSanitized_(rawName);
     if (fileExistsInFolder_(destFolder, docName)) {
-      Logger.log('Skipping duplicate: ' + docName);
+      Logger.log('Skip existing: ' + docName);
       return;
     }
+
     const doc = DocumentApp.create(docName);
-    // Move to the destination folder (and remove from root)
     const docFile = DriveApp.getFileById(doc.getId());
-    destFolder.addFile(docFile);
-    DriveApp.getRootFolder().removeFile(docFile);
+    try { destFolder.addFile(docFile); } catch (e) { Logger.log('addFile warning: ' + e); }
+    try { DriveApp.getRootFolder().removeFile(docFile); } catch (e) { Logger.log('removeFile warning: ' + e); }
 
     renderReport_(doc, group, data.headers);
-
     doc.saveAndClose();
+
     Logger.log('Created: ' + docName);
   });
 }
 
-/**
- * Try to pick the "Form Responses 1" sheet if present; otherwise return first sheet.
- */
+/** ---------- CONVERT TO DOCS (optional helpers retained) ---------- **/
+
+function readConvertFlag_(ssOpt) {
+  const ss = ssOpt || locateSpreadsheet_();
+  const tab = ss.getSheetByName(CONFIG.convertSheetName);
+  if (!tab) return false;
+  const v = tab.getRange(CONFIG.convertFlagRangeA1).getValue();
+  return v === true || String(v).toUpperCase() === 'TRUE';
+}
+
+function setConvertFlag_(ssOpt, val) {
+  const ss = ssOpt || locateSpreadsheet_();
+  const tab = ss.getSheetByName(CONFIG.convertSheetName);
+  if (!tab) return;
+  tab.getRange(CONFIG.convertFlagRangeA1).setValue(!!val);
+}
+
+/** If you ever move this back to a standalone project, this will re-locate the sheet by path. */
+function locateSpreadsheet_() {
+  const srcFolder = getFolderByPath_(CONFIG.sourcePath);
+  if (!srcFolder) throw new Error('Source base folder not found: ' + CONFIG.sourcePath.join(' / '));
+  const ssFile = getFileByNameInFolder_(srcFolder, CONFIG.sourceSheetName);
+  if (!ssFile) throw new Error('Spreadsheet not found in source folder: ' + CONFIG.sourceSheetName);
+  return SpreadsheetApp.openById(ssFile.getId());
+}
+
+/** ---------- SHEET HELPERS ---------- **/
+
 function pickLikelyFormSheet_(ss) {
-  const named = ss.getSheetByName('Form Responses 1');
-  if (named) return named;
-  const fallback = ss.getSheets()[0];
-  return fallback;
+  return ss.getSheetByName('Form Responses 1') || ss.getSheets()[0];
 }
 
-/**
- * Reads header row and data rows
- */
 function getSheetDataWithHeaders_(sheet) {
-  const range = sheet.getDataRange();
-  const values = range.getValues();
-  if (values.length < 2) {
-    return { headers: values[0] || [], rows: [] };
-  }
-  const headers = values[0].map(h => (h || '').toString().trim());
-  const rows = values.slice(1).map(r => r.map(c => (c === '' || c === null) ? '' : c));
-  return { headers, rows };
+  const values = sheet.getDataRange().getValues();
+  if (!values.length) return { headers: [], rows: [] };
+  const headers = values[0].map(function(h){ return (h || '').toString().trim(); });
+  const rows = values.slice(1).map(function(r){
+    return r.map(function(c){ return (c === '' || c === null) ? '' : c; });
+  });
+  return { headers: headers, rows: rows };
 }
 
-/**
- * Writes "N/A" into empty cells (except Timestamp) in our in-memory rows,
- * and returns a list of [r,c] changes. Then caller commits via setValues.
- */
-function fillBlanksWithNA_(sheet, data) {
-  const changes = [];
-  const tsIdx = indexOfHeader_(data.headers, ['Timestamp', 'Date', 'Audit Date']); // don't overwrite timestamp
-  for (let r = 0; r < data.rows.length; r++) {
-    for (let c = 0; c < data.headers.length; c++) {
+function fillBlanksWithNA_(data) {
+  var changed = false;
+  var tsIdx = indexOfHeader_(data.headers, ['Timestamp', 'Audit Date', 'Date']);
+  for (var r = 0; r < data.rows.length; r++) {
+    for (var c = 0; c < data.headers.length; c++) {
       if (c === tsIdx) continue;
       if (data.rows[r][c] === '') {
         data.rows[r][c] = 'N/A';
-        changes.push([r, c]);
+        changed = true;
       }
     }
   }
-  return changes;
+  return changed;
 }
 
-/**
- * Groups rows by (Technician, Date-only)
- */
+/** ---------- GROUPING ---------- **/
+
 function groupRowsByTechAndDate_(data) {
-  const tz = CONFIG.timezone;
-  const dateIdx = CONFIG.fallbackColumns.dateColIndex1Based - 1;
-  const techIdx = CONFIG.fallbackColumns.techColIndex1Based - 1;
+  var tz = CONFIG.timezone;
+  var dateIdx = indexOfHeader_(data.headers, ['Timestamp', 'Audit Date', 'Date'], CONFIG.fallbackColumns.dateColIndex1Based - 1);
+  var techIdx = indexOfHeader_(data.headers, ['Technician Name', 'Technician', 'Employee'], CONFIG.fallbackColumns.techColIndex1Based - 1);
 
-  const smartDateIdx = indexOfHeader_(data.headers, ['Timestamp', 'Audit Date', 'Date'], dateIdx);
-  const smartTechIdx = indexOfHeader_(data.headers, ['Technician', 'Technician Name', 'Employee'], techIdx);
+  var map = {};
 
-  const groupsMap = new Map();
+  data.rows.forEach(function(row) {
+    var rawDate = row[dateIdx];
+    var tech = (row[techIdx] || '').toString().trim() || 'Unknown';
+    var dateOnly = dateOnlyString_(rawDate, tz);
+    var key = tech + '||' + dateOnly;
+    if (!map[key]) map[key] = { tech: tech, date: dateOnly, rows: [] };
+    map[key].rows.push(row);
+  });
 
-  for (const row of data.rows) {
-    const rawTs = row[smartDateIdx];
-    const rawTech = (row[smartTechIdx] || '').toString().trim();
-    const dateOnly = dateOnlyString_(rawTs, tz);
-
-    const key = rawTech + '||' + dateOnly;
-    if (!groupsMap.has(key)) {
-      groupsMap.set(key, { tech: rawTech || 'Unknown', date: dateOnly, rows: [] });
-    }
-    groupsMap.get(key).rows.push(row);
-  }
-
-  return Array.from(groupsMap.values());
+  return Object.keys(map).map(function(k){ return map[k]; });
 }
 
 function dateOnlyString_(value, timezone) {
-  // Handle both Date objects and text
-  let d = value instanceof Date ? value : new Date(value);
-  if (isNaN(d.getTime())) {
-    // best-effort: treat as today when bad
-    d = new Date();
-  }
-  // Format as M/d/yy (matches your sample)
-  const mdy = Utilities.formatDate(d, timezone, 'M/d/yy');
-  return mdy;
+  var d = (value instanceof Date) ? value : new Date(value);
+  if (isNaN(d.getTime())) d = new Date();
+  return Utilities.formatDate(d, timezone, 'M-d-yy'); // hyphens keep filenames safe
 }
 
-function buildDocName_(technician, dateOnly) {
-  // Example: QA Field Report - Tyler Kerkhove 7/1/25
-  return `QA Field Report - ${technician || 'Unknown'} ${dateOnly}`;
-}
+/** ---------- DOC RENDERING ---------- **/
 
-/**
- * Renders the full report into the Document for a single (Tech, Date) group.
- * If multiple rows exist for that day, renders multiple "Inspection" blocks in the same doc.
- */
 function renderReport_(doc, group, headers) {
-  const body = doc.getBody();
+  var body = doc.getBody();
   body.clear();
 
-  group.rows.forEach((row, idx) => {
-    if (idx > 0) {
-      body.appendPageBreak();
+  // ===== Title as NORMAL paragraph (bold 18, no indent, no spacing-before) =====
+  var titlePara = body.appendParagraph('QA FIELD SUMMARY REPORT');
+  titlePara
+    .setHeading(DocumentApp.ParagraphHeading.NORMAL) // avoid Heading 1 style indentation
+    .setBold(true)
+    .setFontSize(18)
+    .setAlignment(DocumentApp.HorizontalAlignment.LEFT)
+    .setIndentStart(0)
+    .setIndentFirstLine(0)
+    .setIndentEnd(0)
+    .setSpacingBefore(0)
+    .setSpacingAfter(6);
+
+  // Context (11)
+  appendNormal_(body, 'Technician: ' + toText_(group.tech));
+  appendNormal_(body, 'Audit Date: ' + toText_(group.date));
+  addSpacer_(body, 6);
+
+  // Each inspection row — put each report on its own page
+  group.rows.forEach(function(row, idx) {
+    if (idx > 0) body.appendPageBreak(); // Report 2 -> page 2, etc.
+
+    // Section title (bold; default indent) — font 11
+    var sec = body.appendParagraph('Inspection ' + (idx + 1));
+    sec.setBold(true).setFontSize(11);
+
+    // Metadata lines (ALL normal, 11)
+    var fieldValues = extractFieldValues_(headers, row);
+
+    appendNormal_(body, 'Audit Date: ' + toText_(fieldValues['Audit Date']));
+
+    // Location # — preferred trailing " space + digits " at end; fallback to legacy
+    var locationRaw = fieldValues['Location #'];
+    var locationNum = extractLocationNumberTrailing_(locationRaw);
+    if (locationNum === null) {
+      locationNum = extractLocationNumberLegacy_(locationRaw);
     }
+    appendNormal_(body, 'Location #: ' + toText_(locationNum));
 
-    // Title
-    const title = body.appendParagraph('QA FIELD REPORT SUMMARY');
-    title.setHeading(DocumentApp.ParagraphHeading.HEADING1).setAlignment(DocumentApp.HorizontalAlignment.LEFT);
+    appendNormal_(body, 'Type Of Service: ' + toText_(fieldValues['Type Of Service']));
+    appendNormal_(body, 'Auditor: ' + toText_(fieldValues['Auditor']));
+    appendNormal_(body, 'Technician: ' + toText_(fieldValues['Technician'] || group.tech));
+    appendNormal_(body, 'Email: ' + toText_(fieldValues['Email']));
 
-    const fieldValues = extractFieldValues_(headers, row);
+    addSpacer_(body, 0);
 
-    // Top metadata (as a clean two-column table)
-    const metaTable = body.appendTable([
-      ['Audit Date:', fieldValues['Audit Date']],
-      ['Location #:', fieldValues['Location #']],
-      ['Type Of Service:', fieldValues['Type Of Service']],
-      ['Auditor:', fieldValues['Auditor']],
-      ['Technician:', fieldValues['Technician'] || group.tech],
-      ['Email:', fieldValues['Email']],
-      ['Name and account Number:', fieldValues['Name and account Number']]
+    // Ratings header (bold 11)
+    var rh = body.appendParagraph('Inspection Ratings:');
+    rh.setBold(true).setFontSize(11);
+
+    // Ratings lines (ALL normal, 11)
+    CONFIG.ratingsOrder.forEach(function(label) {
+      var v = findRatingValue_(headers, row, label);
+      appendNormal_(body, label + ': ' + toText_(v));
+    });
+
+    // Observations header (bold 11) + content 11
+    var notes = getFirstExisting_(headers, row, [
+      'Supply expanded notes on any of the above questions in this space.',
+      'Observations & Recommendations', 'Observations', 'Recommendations', 'Notes', 'Comments'
     ]);
-    styleLeftLabels_(metaTable);
-
-    body.appendParagraph('Inspection Ratings:').setBold(true);
-
-    // Ratings list
-    CONFIG.ratingsOrder.forEach(label => {
-      const v = getFirstExisting_(headers, row, [label]);
-      if (v !== null) {
-        body.appendParagraph(`● ${label}: ${coalesceNA_(v)}`);
-      }
-    });
-
-    // Narrative sections
-    Object.keys(CONFIG.narrativeSections).forEach(sectionLabel => {
-      const candidates = CONFIG.narrativeSections[sectionLabel];
-      const v = getFirstExisting_(headers, row, candidates);
-      if (v !== null) {
-        body.appendParagraph('').setSpacingAfter(2);
-        body.appendParagraph(sectionLabel + ':').setBold(true);
-        body.appendParagraph(coalesceNA_(v));
-      }
-    });
-
-    // “Another if applicable” placeholder if you used this in your form
-    // You can add more narrative fields similarly:
-    // body.appendParagraph('\n*Another if applicable').setItalic(true);
-
-    // Summary of Key Findings block
-    body.appendParagraph('\nSummary of Key Findings:').setBold(true);
-    const kfTableRows = CONFIG.keyFindingsSections.map(k => {
-      const v = getFirstExisting_(headers, row, [k]);
-      return [`${k}:`, coalesceNA_(v !== null ? v : '')];
-    });
-    const kfTable = body.appendTable(kfTableRows);
-    styleLeftLabels_(kfTable);
-
-    // Recommendation section (optional block—try likely header names)
-    const rec = getFirstExisting_(headers, row, ['Recommendations for Follow-Up', 'Follow-Up', 'Follow Up']);
-    if (rec !== null) {
-      body.appendParagraph('\nRecommendations for Follow-Up:').setBold(true);
-      body.appendParagraph(coalesceNA_(rec));
+    if (notes !== null) {
+      addSpacer_(body, 2);
+      var oh = body.appendParagraph('Observations & Recommendations:');
+      oh.setBold(true).setFontSize(11);
+      appendNormal_(body, toText_(notes));
     }
-
-    // Footer
-    body.appendParagraph('\nPrepared by:');
-    body.appendParagraph("Adam’s Quality Team");
-    body.appendParagraph('“Doing our Best to be the Best – The Adam’s Way.”').setItalic(true);
   });
+
+  // Force Key Summary Findings to the LAST PAGE
+  body.appendPageBreak();
+
+  // Key Summary Findings — bold header (11) + labeled blank lines (11)
+  var ksf = body.appendParagraph('Key Summary Findings:');
+  ksf.setBold(true).setFontSize(11);
+  CONFIG.keyFindingsLabels.forEach(function(label) {
+    appendNormal_(body, label + ':');
+    appendNormal_(body, ''); // blank line to type into
+  });
+
+  // Footer (11)
+  body.appendParagraph('');
+  appendNormal_(body, 'Prepared by:');
+  appendNormal_(body, 'Adam’s Quality Team');
+  var motto = body.appendParagraph('“Doing our Best to be the Best – The Adam’s Way.”');
+  motto.setItalic(true).setBold(false).setFontSize(11);
+
+  // ===== Enforce font size 11 everywhere, then bump title back to 18 =====
+  var docText = body.editAsText();
+  docText.setFontSize(11);
+  titlePara.setFontSize(18); // keep title 18 after reset
 }
 
-function styleLeftLabels_(table) {
-  // Bold left cells, add some padding-ish spacing via Paragraph attributes
-  for (let r = 0; r < table.getNumRows(); r++) {
-    const cell0 = table.getCell(r, 0);
-    const p0 = cell0.getChild(0).asParagraph();
-    p0.setBold(true);
+/** ---------- EXTRACTION & MATCHING ---------- **/
+
+// Preferred extractor — captures trailing number with a leading space, e.g. "... 1686795"
+function extractLocationNumberTrailing_(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number') return String(value);
+  var s = String(value);
+  var m = s.match(/\s(\d+)\s*$/);
+  return m ? m[1] : null;
+}
+
+// Legacy/fallback extractor — handles "1686795, Jean Schreier" and general digit runs
+function extractLocationNumberLegacy_(value) {
+  if (value === null || value === undefined) return 'N/A';
+  if (typeof value === 'number') return String(value);
+  var s = String(value);
+  if (s.indexOf(',') !== -1) {
+    var first = s.split(',')[0].trim();
+    var m1 = first.match(/\d+/);
+    if (m1) return m1[0];
   }
+  var m = s.match(/\d+/);
+  return m ? m[0] : 'N/A';
 }
 
-/**
- * Extracts mapped values for the top metadata section.
- */
+function findRatingValue_(headers, row, label) {
+  var patterns = CONFIG.ratingMatchers[label] || [];
+  var hits = [];
+
+  headers.forEach(function(h, i) {
+    var H = (h || '').toString();
+    if (patterns.some(function(rx){ return rx.test(H); })) {
+      hits.push({ i: i, h: H });
+    }
+  });
+
+  // Avoid follow-up text like "Were additional..." / "What additional..."
+  var filtered = hits.filter(function(x){ return !/^\s*(Were|What)\s+additional/i.test(x.h); });
+  var choice = filtered.length ? filtered[0] : (hits[0] || null);
+  if (!choice) return 'N/A';
+
+  var val = row[choice.i];
+  return (val === null || val === undefined || val === '') ? 'N/A' : val;
+}
+
+/** ---------- RENDERING UTILITIES ---------- **/
+
+function toText_(v) {
+  if (v === null || v === undefined || v === '') return 'N/A';
+  if (v instanceof Date) return Utilities.formatDate(v, CONFIG.timezone, 'M/d/yy h:mm a');
+  return String(v);
+}
+
+// Normal paragraph helper: NOT bold, font 11
+function appendNormal_(body, text) {
+  var p = body.appendParagraph(text);
+  p.setBold(false).setFontSize(11);
+  return p;
+}
+
+// Spacer helper: inserts a blank paragraph with given spacingAfter (points)
+function addSpacer_(body, spacingAfter) {
+  var p = body.appendParagraph('');
+  if (typeof spacingAfter === 'number') p.setSpacingAfter(spacingAfter);
+  p.setFontSize(11);
+  return p;
+}
+
+/** ---------- LOOKUPS ---------- **/
+
 function extractFieldValues_(headers, row) {
-  const out = {};
-  Object.keys(CONFIG.fieldMap).forEach(label => {
-    const candidates = CONFIG.fieldMap[label];
-    const v = getFirstExisting_(headers, row, candidates);
-    out[label] = coalesceNA_(v);
+  var out = {};
+  Object.keys(CONFIG.fieldMap).forEach(function(label) {
+    var candidates = CONFIG.fieldMap[label];
+    var v = getFirstExisting_(headers, row, candidates);
+    out[label] = (v === null || v === undefined || v === '') ? 'N/A' : v;
   });
   return out;
 }
 
-function coalesceNA_(value) {
-  const v = (value === null || value === undefined || value === '') ? 'N/A' : value;
-  return v;
-}
-
 function getFirstExisting_(headers, row, candidateHeaders) {
-  for (const name of candidateHeaders) {
-    const idx = indexOfHeader_(headers, [name]);
+  for (var i = 0; i < candidateHeaders.length; i++) {
+    var idx = indexOfHeader_(headers, [candidateHeaders[i]]);
     if (idx > -1) return row[idx];
   }
   return null;
 }
 
-function indexOfHeader_(headers, names, fallbackIndex = -1) {
-  // Case-insensitive header matching
-  const norm = headers.map(h => h.toString().trim().toLowerCase());
-  for (const n of names) {
-    const i = norm.indexOf(n.toString().trim().toLowerCase());
-    if (i > -1) return i;
+function indexOfHeader_(headers, names, fallbackIndex) {
+  if (fallbackIndex === undefined) fallbackIndex = -1;
+  var norm = headers.map(function(h){ return h.toString().trim().toLowerCase(); });
+  for (var i = 0; i < names.length; i++) {
+    var n = names[i].toString().trim().toLowerCase();
+    var j = norm.indexOf(n);
+    if (j > -1) return j;
   }
   return fallbackIndex;
 }
 
-/* ----------------- Drive helpers ----------------- */
+/** ---------- DRIVE HELPERS ---------- **/
 
 function getFolderByPath_(parts) {
   if (!parts || !parts.length) return null;
-  let folder = DriveApp.getFoldersByName(parts[0]);
-  if (!folder.hasNext()) return null;
-  let current = folder.next();
-  for (let i = 1; i < parts.length; i++) {
+  var it = DriveApp.getFoldersByName(parts[0]);
+  if (!it.hasNext()) return null;
+  var current = it.next();
+  for (var i = 1; i < parts.length; i++) {
     current = getChildFolderByName_(current, parts[i]);
     if (!current) return null;
   }
@@ -341,10 +489,10 @@ function getFolderByPath_(parts) {
 
 function ensureFolderPath_(parts) {
   if (!parts || !parts.length) return null;
-  let it = DriveApp.getFoldersByName(parts[0]);
-  let current = it.hasNext() ? it.next() : DriveApp.createFolder(parts[0]);
-  for (let i = 1; i < parts.length; i++) {
-    let next = getChildFolderByName_(current, parts[i]);
+  var it = DriveApp.getFoldersByName(parts[0]);
+  var current = it.hasNext() ? it.next() : DriveApp.createFolder(parts[0]);
+  for (var i = 1; i < parts.length; i++) {
+    var next = getChildFolderByName_(current, parts[i]);
     if (!next) next = current.createFolder(parts[i]);
     current = next;
   }
@@ -352,16 +500,20 @@ function ensureFolderPath_(parts) {
 }
 
 function getChildFolderByName_(parent, name) {
-  const it = parent.getFoldersByName(name);
+  var it = parent.getFoldersByName(name);
   return it.hasNext() ? it.next() : null;
 }
 
 function getFileByNameInFolder_(folder, name) {
-  const it = folder.getFilesByName(name);
+  var it = folder.getFilesByName(name);
   return it.hasNext() ? it.next() : null;
 }
 
 function fileExistsInFolder_(folder, filename) {
-  const it = folder.getFilesByName(filename);
+  var it = folder.getFilesByName(filename);
   return it.hasNext();
+}
+
+function filenameSanitized_(name) {
+  return String(name).replace(/[\\/:*?"<>|]/g, '-');
 }
