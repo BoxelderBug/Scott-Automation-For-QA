@@ -1,519 +1,883 @@
-/**
- * QA Field Report generator
- * - Runs only when Convert To Docs!A2 is TRUE, then resets it to FALSE
- * - Title: normal paragraph, bold 18, no indent, no spacing-before (flush-left)
- * - Body text: 11 pt everywhere
- * - Key Summary Findings: bold header (11) + blank lines; forced to last page
- * - Location #: prefers trailing " space + digits " (e.g., "... 1686795"), falls back to legacy formats
- * - Removes "Name and account Number"
- * - Auditor from header (works with your new column B)
- * - De-dupes by sanitized filename "QA Field Report - [Technician] [M-d-yy]"
- */
-
-const CONFIG = {
-  timezone: 'America/Chicago',
-
-  // Folder & spreadsheet
-  sourcePath: [
-    'Quality Assurance Process (Internal)',
-    'Internal QA Audits'
-  ],
-  sourceSheetName: 'Technician Quality Inspection Form (Responses)',
-
-  // Output folder
-  destinationPath: [
-    'Quality Assurance Process (Internal)',
-    'Internal QA Audits',
-    'QA Field Reports',
-    'Auto Reports'
-  ],
-
-  // Checkbox gate (A2 per your note)
-  convertSheetName: 'Convert To Docs',
-  convertFlagRangeA1: 'A2',
-
-  // Top metadata fields (plain lines)
-  fieldMap: {
-    'Audit Date': ['Timestamp', 'Audit Date', 'Date'],
-    'Location #': ['Location #', 'Location', 'Account #', 'Account Number'],
-    'Type Of Service': ['Type of Service', 'Type Of Service', 'Service Type'],
-    'Auditor': ['Auditor', 'Audited By'],
-    'Technician': ['Technician Name', 'Technician', 'Employee'],
-    'Email': ['Email Address', 'Email', 'Technician Email', 'Contact Email']
-  },
-
-  // Ratings shown; values found via fuzzy matching of long form headers
-  ratingsOrder: [
-    'Notes & Product Use',
-    'Exterior Condition',
-    'Equipment Condition',
-    'Product Application',
-    'Exclusion Efforts',
-    'Interior Rodent Efforts',
-    'Interior Pest Control',
-    'Paperwork Accuracy',
-    'Customer Service'
-  ],
-
-  ratingMatchers: {
-    'Notes & Product Use': [
-      /notes.*products/i, /service ticket/i, /appropriate use of products/i
-    ],
-    'Exterior Condition': [
-      /exterior/i, /web presence/i, /wasp/i, /appropriate service/i
-    ],
-    'Equipment Condition': [
-      /equipment.*clean/i, /good working order/i, /operable|secure/i
-    ],
-    'Product Application': [
-      /products that were used/i, /according to the label/i, /company policy/i
-    ],
-    'Exclusion Efforts': [
-      /current rodent issues/i, /prohibits rodent entry/i, /exclusion/i
-    ],
-    'Interior Rodent Efforts': [
-      /rodent prevention efforts/i
-    ],
-    'Interior Pest Control': [
-      /general pest control.*inside/i, /on the inside of the structure/i
-    ],
-    'Paperwork Accuracy': [
-      /paperwork accuracy/i, /data inputs.*correct/i
-    ],
-    'Customer Service': [
-      /Interview the customer/i, /Customer Service/i, /Rate .*Customer Service/i
-    ]
-  },
-
-  // Key Summary Findings labels
-  keyFindingsLabels: [
-    'Documentation',
-    'Equipment Servicing',
-    'Exterior Maintenance',
-    'Customer Communication'
-  ],
-
-  // Fallbacks (header matching is used first)
-  fallbackColumns: {
-    dateColIndex1Based: 1, // A
-    techColIndex1Based: 3  // C
-  }
-};
-
-/**
- * INSTALLABLE TRIGGER: From spreadsheet → On edit → onEditWatcher
- * Reacts only to Convert To Docs!A2 edits. Always flips back to FALSE.
- */
-function onEditWatcher(e) {
-  const lock = LockService.getScriptLock();
-  try {
-    lock.tryLock(30000);
-
-    if (!e || !e.range) return;
-    var sheet = e.range.getSheet();
-    if (sheet.getName() !== CONFIG.convertSheetName) return;
-    if (e.range.getA1Notation() !== CONFIG.convertFlagRangeA1) return;
-
-    // Only run when box changed to TRUE
-    var newVal = (typeof e.value !== 'undefined') ? e.value : String(e.range.getValue());
-    var isTrue = (newVal === true) || (String(newVal).toUpperCase() === 'TRUE');
-    if (!isTrue) return;
-
-    Logger.log('Checkbox TRUE detected — starting report generation…');
-    runQaReportGeneration();
-    Logger.log('Report generation finished.');
-
-  } catch (err) {
-    Logger.log('onEditWatcher error: ' + (err && err.stack ? err.stack : err));
-  } finally {
-    // Always uncheck, even on error
-    try {
-      var ss = (e && e.source) ? e.source : SpreadsheetApp.getActiveSpreadsheet();
-      var tab = ss.getSheetByName(CONFIG.convertSheetName);
-      if (tab) tab.getRange(CONFIG.convertFlagRangeA1).setValue(false);
-      SpreadsheetApp.flush();
-      Logger.log('Checkbox reset to FALSE.');
-    } catch (err2) {
-      Logger.log('Failed to reset checkbox: ' + err2);
-    }
-    try { lock.releaseLock(); } catch (_) {}
-  }
-}
-
-/**
- * Main generator.
- * NOTE: Because the script is container-bound now, we use the active spreadsheet.
- * (locateSpreadsheet_ remains available if you ever move back to a standalone project.)
- */
-function runQaReportGeneration() {
-  // Use the sheet this script is bound to
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-
-  // Work off the responses tab
-  const sheet = pickLikelyFormSheet_(ss);
-  const data = getSheetDataWithHeaders_(sheet);
-  if (!data.rows.length) {
-    Logger.log('No rows.');
-    return;
-  }
-
-  // Fill blanks with "N/A" (except timestamp) and write back
-  const changed = fillBlanksWithNA_(data);
-  if (changed) {
-    sheet.getRange(2, 1, data.rows.length, data.headers.length).setValues(data.rows);
-  }
-
-  // Group by (Technician, Date-only)
-  const groups = groupRowsByTechAndDate_(data);
-
-  // Destination
-  const destFolder = ensureFolderPath_(CONFIG.destinationPath);
-  if (!destFolder) throw new Error('Destination path could not be created.');
-
-  // Create reports
-  groups.forEach(function(group) {
-    const rawName = 'QA Field Report - ' + group.tech + ' ' + group.date;
-    const docName = filenameSanitized_(rawName);
-    if (fileExistsInFolder_(destFolder, docName)) {
-      Logger.log('Skip existing: ' + docName);
-      return;
-    }
-
-    const doc = DocumentApp.create(docName);
-    const docFile = DriveApp.getFileById(doc.getId());
-    try { destFolder.addFile(docFile); } catch (e) { Logger.log('addFile warning: ' + e); }
-    try { DriveApp.getRootFolder().removeFile(docFile); } catch (e) { Logger.log('removeFile warning: ' + e); }
-
-    renderReport_(doc, group, data.headers);
-    doc.saveAndClose();
-
-    Logger.log('Created: ' + docName);
-  });
-}
-
-/** ---------- CONVERT TO DOCS (optional helpers retained) ---------- **/
-
-function readConvertFlag_(ssOpt) {
-  const ss = ssOpt || locateSpreadsheet_();
-  const tab = ss.getSheetByName(CONFIG.convertSheetName);
-  if (!tab) return false;
-  const v = tab.getRange(CONFIG.convertFlagRangeA1).getValue();
-  return v === true || String(v).toUpperCase() === 'TRUE';
-}
-
-function setConvertFlag_(ssOpt, val) {
-  const ss = ssOpt || locateSpreadsheet_();
-  const tab = ss.getSheetByName(CONFIG.convertSheetName);
-  if (!tab) return;
-  tab.getRange(CONFIG.convertFlagRangeA1).setValue(!!val);
-}
-
-/** If you ever move this back to a standalone project, this will re-locate the sheet by path. */
-function locateSpreadsheet_() {
-  const srcFolder = getFolderByPath_(CONFIG.sourcePath);
-  if (!srcFolder) throw new Error('Source base folder not found: ' + CONFIG.sourcePath.join(' / '));
-  const ssFile = getFileByNameInFolder_(srcFolder, CONFIG.sourceSheetName);
-  if (!ssFile) throw new Error('Spreadsheet not found in source folder: ' + CONFIG.sourceSheetName);
-  return SpreadsheetApp.openById(ssFile.getId());
-}
-
-/** ---------- SHEET HELPERS ---------- **/
-
-function pickLikelyFormSheet_(ss) {
-  return ss.getSheetByName('Form Responses 1') || ss.getSheets()[0];
-}
-
-function getSheetDataWithHeaders_(sheet) {
-  const values = sheet.getDataRange().getValues();
-  if (!values.length) return { headers: [], rows: [] };
-  const headers = values[0].map(function(h){ return (h || '').toString().trim(); });
-  const rows = values.slice(1).map(function(r){
-    return r.map(function(c){ return (c === '' || c === null) ? '' : c; });
-  });
-  return { headers: headers, rows: rows };
-}
-
-function fillBlanksWithNA_(data) {
-  var changed = false;
-  var tsIdx = indexOfHeader_(data.headers, ['Timestamp', 'Audit Date', 'Date']);
-  for (var r = 0; r < data.rows.length; r++) {
-    for (var c = 0; c < data.headers.length; c++) {
-      if (c === tsIdx) continue;
-      if (data.rows[r][c] === '') {
-        data.rows[r][c] = 'N/A';
-        changed = true;
-      }
-    }
-  }
-  return changed;
-}
-
-/** ---------- GROUPING ---------- **/
-
-function groupRowsByTechAndDate_(data) {
-  var tz = CONFIG.timezone;
-  var dateIdx = indexOfHeader_(data.headers, ['Timestamp', 'Audit Date', 'Date'], CONFIG.fallbackColumns.dateColIndex1Based - 1);
-  var techIdx = indexOfHeader_(data.headers, ['Technician Name', 'Technician', 'Employee'], CONFIG.fallbackColumns.techColIndex1Based - 1);
-
-  var map = {};
-
-  data.rows.forEach(function(row) {
-    var rawDate = row[dateIdx];
-    var tech = (row[techIdx] || '').toString().trim() || 'Unknown';
-    var dateOnly = dateOnlyString_(rawDate, tz);
-    var key = tech + '||' + dateOnly;
-    if (!map[key]) map[key] = { tech: tech, date: dateOnly, rows: [] };
-    map[key].rows.push(row);
-  });
-
-  return Object.keys(map).map(function(k){ return map[k]; });
-}
-
-function dateOnlyString_(value, timezone) {
-  var d = (value instanceof Date) ? value : new Date(value);
-  if (isNaN(d.getTime())) d = new Date();
-  return Utilities.formatDate(d, timezone, 'M-d-yy'); // hyphens keep filenames safe
-}
-
-/** ---------- DOC RENDERING ---------- **/
-
-function renderReport_(doc, group, headers) {
-  var body = doc.getBody();
-  body.clear();
-
-  // ===== Title as NORMAL paragraph (bold 18, no indent, no spacing-before) =====
-  var titlePara = body.appendParagraph('QA FIELD SUMMARY REPORT');
-  titlePara
-    .setHeading(DocumentApp.ParagraphHeading.NORMAL) // avoid Heading 1 style indentation
-    .setBold(true)
-    .setFontSize(18)
-    .setAlignment(DocumentApp.HorizontalAlignment.LEFT)
-    .setIndentStart(0)
-    .setIndentFirstLine(0)
-    .setIndentEnd(0)
-    .setSpacingBefore(0)
-    .setSpacingAfter(6);
-
-  // Context (11)
-  appendNormal_(body, 'Technician: ' + toText_(group.tech));
-  appendNormal_(body, 'Audit Date: ' + toText_(group.date));
-  addSpacer_(body, 6);
-
-  // Each inspection row — put each report on its own page
-  group.rows.forEach(function(row, idx) {
-    if (idx > 0) body.appendPageBreak(); // Report 2 -> page 2, etc.
-
-    // Section title (bold; default indent) — font 11
-    var sec = body.appendParagraph('Inspection ' + (idx + 1));
-    sec.setBold(true).setFontSize(11);
-
-    // Metadata lines (ALL normal, 11)
-    var fieldValues = extractFieldValues_(headers, row);
-
-    appendNormal_(body, 'Audit Date: ' + toText_(fieldValues['Audit Date']));
-
-    // Location # — preferred trailing " space + digits " at end; fallback to legacy
-    var locationRaw = fieldValues['Location #'];
-    var locationNum = extractLocationNumberTrailing_(locationRaw);
-    if (locationNum === null) {
-      locationNum = extractLocationNumberLegacy_(locationRaw);
-    }
-    appendNormal_(body, 'Location #: ' + toText_(locationNum));
-
-    appendNormal_(body, 'Type Of Service: ' + toText_(fieldValues['Type Of Service']));
-    appendNormal_(body, 'Auditor: ' + toText_(fieldValues['Auditor']));
-    appendNormal_(body, 'Technician: ' + toText_(fieldValues['Technician'] || group.tech));
-    appendNormal_(body, 'Email: ' + toText_(fieldValues['Email']));
-
-    addSpacer_(body, 0);
-
-    // Ratings header (bold 11)
-    var rh = body.appendParagraph('Inspection Ratings:');
-    rh.setBold(true).setFontSize(11);
-
-    // Ratings lines (ALL normal, 11)
-    CONFIG.ratingsOrder.forEach(function(label) {
-      var v = findRatingValue_(headers, row, label);
-      appendNormal_(body, label + ': ' + toText_(v));
-    });
-
-    // Observations header (bold 11) + content 11
-    var notes = getFirstExisting_(headers, row, [
-      'Supply expanded notes on any of the above questions in this space.',
-      'Observations & Recommendations', 'Observations', 'Recommendations', 'Notes', 'Comments'
-    ]);
-    if (notes !== null) {
-      addSpacer_(body, 2);
-      var oh = body.appendParagraph('Observations & Recommendations:');
-      oh.setBold(true).setFontSize(11);
-      appendNormal_(body, toText_(notes));
-    }
-  });
-
-  // Force Key Summary Findings to the LAST PAGE
-  body.appendPageBreak();
-
-  // Key Summary Findings — bold header (11) + labeled blank lines (11)
-  var ksf = body.appendParagraph('Key Summary Findings:');
-  ksf.setBold(true).setFontSize(11);
-  CONFIG.keyFindingsLabels.forEach(function(label) {
-    appendNormal_(body, label + ':');
-    appendNormal_(body, ''); // blank line to type into
-  });
-
-  // Footer (11)
-  body.appendParagraph('');
-  appendNormal_(body, 'Prepared by:');
-  appendNormal_(body, 'Adam’s Quality Team');
-  var motto = body.appendParagraph('“Doing our Best to be the Best – The Adam’s Way.”');
-  motto.setItalic(true).setBold(false).setFontSize(11);
-
-  // ===== Enforce font size 11 everywhere, then bump title back to 18 =====
-  var docText = body.editAsText();
-  docText.setFontSize(11);
-  titlePara.setFontSize(18); // keep title 18 after reset
-}
-
-/** ---------- EXTRACTION & MATCHING ---------- **/
-
-// Preferred extractor — captures trailing number with a leading space, e.g. "... 1686795"
-function extractLocationNumberTrailing_(value) {
-  if (value === null || value === undefined) return null;
-  if (typeof value === 'number') return String(value);
-  var s = String(value);
-  var m = s.match(/\s(\d+)\s*$/);
-  return m ? m[1] : null;
-}
-
-// Legacy/fallback extractor — handles "1686795, Jean Schreier" and general digit runs
-function extractLocationNumberLegacy_(value) {
-  if (value === null || value === undefined) return 'N/A';
-  if (typeof value === 'number') return String(value);
-  var s = String(value);
-  if (s.indexOf(',') !== -1) {
-    var first = s.split(',')[0].trim();
-    var m1 = first.match(/\d+/);
-    if (m1) return m1[0];
-  }
-  var m = s.match(/\d+/);
-  return m ? m[0] : 'N/A';
-}
-
-function findRatingValue_(headers, row, label) {
-  var patterns = CONFIG.ratingMatchers[label] || [];
-  var hits = [];
-
-  headers.forEach(function(h, i) {
-    var H = (h || '').toString();
-    if (patterns.some(function(rx){ return rx.test(H); })) {
-      hits.push({ i: i, h: H });
-    }
-  });
-
-  // Avoid follow-up text like "Were additional..." / "What additional..."
-  var filtered = hits.filter(function(x){ return !/^\s*(Were|What)\s+additional/i.test(x.h); });
-  var choice = filtered.length ? filtered[0] : (hits[0] || null);
-  if (!choice) return 'N/A';
-
-  var val = row[choice.i];
-  return (val === null || val === undefined || val === '') ? 'N/A' : val;
-}
-
-/** ---------- RENDERING UTILITIES ---------- **/
-
-function toText_(v) {
-  if (v === null || v === undefined || v === '') return 'N/A';
-  if (v instanceof Date) return Utilities.formatDate(v, CONFIG.timezone, 'M/d/yy h:mm a');
-  return String(v);
-}
-
-// Normal paragraph helper: NOT bold, font 11
-function appendNormal_(body, text) {
-  var p = body.appendParagraph(text);
-  p.setBold(false).setFontSize(11);
-  return p;
-}
-
-// Spacer helper: inserts a blank paragraph with given spacingAfter (points)
-function addSpacer_(body, spacingAfter) {
-  var p = body.appendParagraph('');
-  if (typeof spacingAfter === 'number') p.setSpacingAfter(spacingAfter);
-  p.setFontSize(11);
-  return p;
-}
-
-/** ---------- LOOKUPS ---------- **/
-
-function extractFieldValues_(headers, row) {
-  var out = {};
-  Object.keys(CONFIG.fieldMap).forEach(function(label) {
-    var candidates = CONFIG.fieldMap[label];
-    var v = getFirstExisting_(headers, row, candidates);
-    out[label] = (v === null || v === undefined || v === '') ? 'N/A' : v;
-  });
-  return out;
-}
-
-function getFirstExisting_(headers, row, candidateHeaders) {
-  for (var i = 0; i < candidateHeaders.length; i++) {
-    var idx = indexOfHeader_(headers, [candidateHeaders[i]]);
-    if (idx > -1) return row[idx];
-  }
-  return null;
-}
-
-function indexOfHeader_(headers, names, fallbackIndex) {
-  if (fallbackIndex === undefined) fallbackIndex = -1;
-  var norm = headers.map(function(h){ return h.toString().trim().toLowerCase(); });
-  for (var i = 0; i < names.length; i++) {
-    var n = names[i].toString().trim().toLowerCase();
-    var j = norm.indexOf(n);
-    if (j > -1) return j;
-  }
-  return fallbackIndex;
-}
-
-/** ---------- DRIVE HELPERS ---------- **/
-
-function getFolderByPath_(parts) {
-  if (!parts || !parts.length) return null;
-  var it = DriveApp.getFoldersByName(parts[0]);
-  if (!it.hasNext()) return null;
-  var current = it.next();
-  for (var i = 1; i < parts.length; i++) {
-    current = getChildFolderByName_(current, parts[i]);
-    if (!current) return null;
-  }
-  return current;
-}
-
-function ensureFolderPath_(parts) {
-  if (!parts || !parts.length) return null;
-  var it = DriveApp.getFoldersByName(parts[0]);
-  var current = it.hasNext() ? it.next() : DriveApp.createFolder(parts[0]);
-  for (var i = 1; i < parts.length; i++) {
-    var next = getChildFolderByName_(current, parts[i]);
-    if (!next) next = current.createFolder(parts[i]);
-    current = next;
-  }
-  return current;
-}
-
-function getChildFolderByName_(parent, name) {
-  var it = parent.getFoldersByName(name);
-  return it.hasNext() ? it.next() : null;
-}
-
-function getFileByNameInFolder_(folder, name) {
-  var it = folder.getFilesByName(name);
-  return it.hasNext() ? it.next() : null;
-}
-
-function fileExistsInFolder_(folder, filename) {
-  var it = folder.getFilesByName(filename);
-  return it.hasNext();
-}
-
-function filenameSanitized_(name) {
-  return String(name).replace(/[\\/:*?"<>|]/g, '-');
-}
+-- ====================================================================
+-- Simple implementation using table variables
+-- No temp tables, no CTEs, nothing added to database
+-- Just run this entire script as one batch
+-- ====================================================================
+
+-- Declare the table variable (exists only during this batch)
+DECLARE @ProductServiceMatrix TABLE (
+    product_name VARCHAR(100),
+    service_name VARCHAR(100),
+    is_valid BIT
+);
+
+-- Load invalid combinations
+INSERT INTO @ProductServiceMatrix (product_name, service_name, is_valid)
+VALUES
+    -- Phantom II (all FALSE)
+    ('Phantom II', 'Premier Home', 0),
+    ('Phantom II', 'Premier Perimeter', 0),
+    ('Phantom II', 'Premier Fall Invaders', 0),
+    ('Phantom II', 'Premier Ants', 0),
+    ('Phantom II', 'Premier Spiders', 0),
+    ('Phantom II', 'Premier Rodents', 0),
+    ('Phantom II', 'Premier Vector Ext.', 0),
+    ('Phantom II', 'Premier Vector-Early Fall', 0),
+    ('Phantom II', 'Premier Vector-Early Spring', 0),
+    ('Phantom II', 'Premier Vector-Early Summer', 0),
+    ('Phantom II', 'Premier Vector-Late Fall', 0),
+    ('Phantom II', 'Premier Vector-Late Spring', 0),
+    ('Phantom II', 'Premier Vector-Mid Summer', 0),
+    ('Phantom II', 'Prevention Ornamental Ext.', 0),
+    ('Phantom II', 'Prevention Plus', 0),
+    ('Phantom II', 'Prevention Pro', 0),
+    ('Phantom II', 'Prevention Paramount Certified', 0),
+    ('Phantom II', '1XR Ant Service', 0),
+    ('Phantom II', '1XR Rodents Service', 0),
+    ('Phantom II', '1XR Rodents Limited Warranty Service', 0),
+    ('Phantom II', '1XR Roaches Service', 0),
+    ('Phantom II', '1XR Perimeter & Spider Service', 0),
+    ('Phantom II', '1XR Fall Invaders Service', 0),
+    ('Phantom II', '1XR Perimeter Service', 0),
+    ('Phantom II', '1XR Filth Flies Service', 0),
+    ('Phantom II', '1XR Small Flies Service', 0),
+    ('Phantom II', '1XR Small Flies Services', 0),
+    ('Phantom II', '1XR Interior Flea Service', 0),
+    ('Phantom II', '1XR Stored Product Pest Service', 0),
+
+    -- PT Alpine Flea & BedBug Aerosol (all FALSE)
+    ('PT Alpine Flea & BedBug Aerosol', 'Premier Home', 0),
+    ('PT Alpine Flea & BedBug Aerosol', 'Premier Perimeter', 0),
+    ('PT Alpine Flea & BedBug Aerosol', 'Premier Fall Invaders', 0),
+    ('PT Alpine Flea & BedBug Aerosol', 'Premier Ants', 0),
+    ('PT Alpine Flea & BedBug Aerosol', 'Premier Spiders', 0),
+    ('PT Alpine Flea & BedBug Aerosol', 'Premier Rodents', 0),
+    ('PT Alpine Flea & BedBug Aerosol', 'Premier Vector Ext.', 0),
+    ('PT Alpine Flea & BedBug Aerosol', 'Premier Vector-Early Fall', 0),
+    ('PT Alpine Flea & BedBug Aerosol', 'Premier Vector-Early Spring', 0),
+    ('PT Alpine Flea & BedBug Aerosol', 'Premier Vector-Early Summer', 0),
+    ('PT Alpine Flea & BedBug Aerosol', 'Premier Vector-Late Fall', 0),
+    ('PT Alpine Flea & BedBug Aerosol', 'Premier Vector-Late Spring', 0),
+    ('PT Alpine Flea & BedBug Aerosol', 'Premier Vector-Mid Summer', 0),
+    ('PT Alpine Flea & BedBug Aerosol', 'Prevention Ornamental Ext.', 0),
+    ('PT Alpine Flea & BedBug Aerosol', 'Prevention Plus', 0),
+    ('PT Alpine Flea & BedBug Aerosol', 'Prevention Pro', 0),
+    ('PT Alpine Flea & BedBug Aerosol', 'Prevention Paramount Certified', 0),
+    ('PT Alpine Flea & BedBug Aerosol', '1XR Ant Service', 0),
+    ('PT Alpine Flea & BedBug Aerosol', '1XR Rodents Service', 0),
+    ('PT Alpine Flea & BedBug Aerosol', '1XR Rodents Limited Warranty Service', 0),
+    ('PT Alpine Flea & BedBug Aerosol', '1XR Roaches Service', 0),
+    ('PT Alpine Flea & BedBug Aerosol', '1XR Perimeter & Spider Service', 0),
+    ('PT Alpine Flea & BedBug Aerosol', '1XR Fall Invaders Service', 0),
+    ('PT Alpine Flea & BedBug Aerosol', '1XR Perimeter Service', 0),
+    ('PT Alpine Flea & BedBug Aerosol', '1XR Filth Flies Service', 0),
+    ('PT Alpine Flea & BedBug Aerosol', '1XR Small Flies Service', 0),
+    ('PT Alpine Flea & BedBug Aerosol', '1XR Small Flies Services', 0),
+    ('PT Alpine Flea & BedBug Aerosol', '1XR Interior Flea Service', 0),
+    ('PT Alpine Flea & BedBug Aerosol', '1XR Stored Product Pest Service', 0),
+
+    -- PT Alpine Fly Bait (FALSE for all except 1XR Filth Flies)
+    ('PT Alpine Fly Bait', 'Premier Home', 0),
+    ('PT Alpine Fly Bait', 'Premier Perimeter', 0),
+    ('PT Alpine Fly Bait', 'Premier Fall Invaders', 0),
+    ('PT Alpine Fly Bait', 'Premier Ants', 0),
+    ('PT Alpine Fly Bait', 'Premier Spiders', 0),
+    ('PT Alpine Fly Bait', 'Premier Rodents', 0),
+    ('PT Alpine Fly Bait', 'Premier Vector Ext.', 0),
+    ('PT Alpine Fly Bait', 'Premier Vector-Early Fall', 0),
+    ('PT Alpine Fly Bait', 'Premier Vector-Early Spring', 0),
+    ('PT Alpine Fly Bait', 'Premier Vector-Early Summer', 0),
+    ('PT Alpine Fly Bait', 'Premier Vector-Late Fall', 0),
+    ('PT Alpine Fly Bait', 'Premier Vector-Late Spring', 0),
+    ('PT Alpine Fly Bait', 'Premier Vector-Mid Summer', 0),
+    ('PT Alpine Fly Bait', 'Prevention Ornamental Ext.', 0),
+    ('PT Alpine Fly Bait', 'Prevention Plus', 0),
+    ('PT Alpine Fly Bait', 'Prevention Pro', 0),
+    ('PT Alpine Fly Bait', 'Prevention Paramount Certified', 0),
+    ('PT Alpine Fly Bait', '1XR Ant Service', 0),
+    ('PT Alpine Fly Bait', '1XR Rodents Service', 0),
+    ('PT Alpine Fly Bait', '1XR Rodents Limited Warranty Service', 0),
+    ('PT Alpine Fly Bait', '1XR Roaches Service', 0),
+    ('PT Alpine Fly Bait', '1XR Perimeter & Spider Service', 0),
+    ('PT Alpine Fly Bait', '1XR Fall Invaders Service', 0),
+    ('PT Alpine Fly Bait', '1XR Perimeter Service', 0),
+    ('PT Alpine Fly Bait', '1XR Small Flies Service', 0),
+    ('PT Alpine Fly Bait', '1XR Small Flies Services', 0),
+    ('PT Alpine Fly Bait', '1XR Interior Flea Service', 0),
+    ('PT Alpine Fly Bait', '1XR Stored Product Pest Service', 0),
+
+    -- PT Pro Control Plus (all FALSE)
+    ('PT Pro Control Plus', 'Premier Home', 0),
+    ('PT Pro Control Plus', 'Premier Perimeter', 0),
+    ('PT Pro Control Plus', 'Premier Fall Invaders', 0),
+    ('PT Pro Control Plus', 'Premier Ants', 0),
+    ('PT Pro Control Plus', 'Premier Spiders', 0),
+    ('PT Pro Control Plus', 'Premier Rodents', 0),
+    ('PT Pro Control Plus', 'Premier Vector Ext.', 0),
+    ('PT Pro Control Plus', 'Premier Vector-Early Fall', 0),
+    ('PT Pro Control Plus', 'Premier Vector-Early Spring', 0),
+    ('PT Pro Control Plus', 'Premier Vector-Early Summer', 0),
+    ('PT Pro Control Plus', 'Premier Vector-Late Fall', 0),
+    ('PT Pro Control Plus', 'Premier Vector-Late Spring', 0),
+    ('PT Pro Control Plus', 'Premier Vector-Mid Summer', 0),
+    ('PT Pro Control Plus', 'Prevention Ornamental Ext.', 0),
+    ('PT Pro Control Plus', 'Prevention Plus', 0),
+    ('PT Pro Control Plus', 'Prevention Pro', 0),
+    ('PT Pro Control Plus', 'Prevention Paramount Certified', 0),
+    ('PT Pro Control Plus', '1XR Ant Service', 0),
+    ('PT Pro Control Plus', '1XR Rodents Service', 0),
+    ('PT Pro Control Plus', '1XR Rodents Limited Warranty Service', 0),
+    ('PT Pro Control Plus', '1XR Roaches Service', 0),
+    ('PT Pro Control Plus', '1XR Perimeter & Spider Service', 0),
+    ('PT Pro Control Plus', '1XR Fall Invaders Service', 0),
+    ('PT Pro Control Plus', '1XR Perimeter Service', 0),
+    ('PT Pro Control Plus', '1XR Filth Flies Service', 0),
+    ('PT Pro Control Plus', '1XR Small Flies Service', 0),
+    ('PT Pro Control Plus', '1XR Small Flies Services', 0),
+    ('PT Pro Control Plus', '1XR Interior Flea Service', 0),
+    ('PT Pro Control Plus', '1XR Stored Product Pest Service', 0),
+
+    -- PT Wasp Freeze II (all FALSE)
+    ('PT Wasp Freeze II', 'Premier Home', 0),
+    ('PT Wasp Freeze II', 'Premier Perimeter', 0),
+    ('PT Wasp Freeze II', 'Premier Fall Invaders', 0),
+    ('PT Wasp Freeze II', 'Premier Ants', 0),
+    ('PT Wasp Freeze II', 'Premier Spiders', 0),
+    ('PT Wasp Freeze II', 'Premier Rodents', 0),
+    ('PT Wasp Freeze II', 'Premier Vector Ext.', 0),
+    ('PT Wasp Freeze II', 'Premier Vector-Early Fall', 0),
+    ('PT Wasp Freeze II', 'Premier Vector-Early Spring', 0),
+    ('PT Wasp Freeze II', 'Premier Vector-Early Summer', 0),
+    ('PT Wasp Freeze II', 'Premier Vector-Late Fall', 0),
+    ('PT Wasp Freeze II', 'Premier Vector-Late Spring', 0),
+    ('PT Wasp Freeze II', 'Premier Vector-Mid Summer', 0),
+    ('PT Wasp Freeze II', 'Prevention Ornamental Ext.', 0),
+    ('PT Wasp Freeze II', 'Prevention Plus', 0),
+    ('PT Wasp Freeze II', 'Prevention Pro', 0),
+    ('PT Wasp Freeze II', 'Prevention Paramount Certified', 0),
+    ('PT Wasp Freeze II', '1XR Ant Service', 0),
+    ('PT Wasp Freeze II', '1XR Rodents Service', 0),
+    ('PT Wasp Freeze II', '1XR Rodents Limited Warranty Service', 0),
+    ('PT Wasp Freeze II', '1XR Roaches Service', 0),
+    ('PT Wasp Freeze II', '1XR Perimeter & Spider Service', 0),
+    ('PT Wasp Freeze II', '1XR Fall Invaders Service', 0),
+    ('PT Wasp Freeze II', '1XR Perimeter Service', 0),
+    ('PT Wasp Freeze II', '1XR Filth Flies Service', 0),
+    ('PT Wasp Freeze II', '1XR Small Flies Service', 0),
+    ('PT Wasp Freeze II', '1XR Small Flies Services', 0),
+    ('PT Wasp Freeze II', '1XR Interior Flea Service', 0),
+    ('PT Wasp Freeze II', '1XR Stored Product Pest Service', 0),
+
+    -- CB40 Extra (all FALSE)
+    ('CB40 Extra', 'Premier Home', 0),
+    ('CB40 Extra', 'Premier Perimeter', 0),
+    ('CB40 Extra', 'Premier Fall Invaders', 0),
+    ('CB40 Extra', 'Premier Ants', 0),
+    ('CB40 Extra', 'Premier Spiders', 0),
+    ('CB40 Extra', 'Premier Rodents', 0),
+    ('CB40 Extra', 'Premier Vector Ext.', 0),
+    ('CB40 Extra', 'Premier Vector-Early Fall', 0),
+    ('CB40 Extra', 'Premier Vector-Early Spring', 0),
+    ('CB40 Extra', 'Premier Vector-Early Summer', 0),
+    ('CB40 Extra', 'Premier Vector-Late Fall', 0),
+    ('CB40 Extra', 'Premier Vector-Late Spring', 0),
+    ('CB40 Extra', 'Premier Vector-Mid Summer', 0),
+    ('CB40 Extra', 'Prevention Ornamental Ext.', 0),
+    ('CB40 Extra', 'Prevention Plus', 0),
+    ('CB40 Extra', 'Prevention Pro', 0),
+    ('CB40 Extra', 'Prevention Paramount Certified', 0),
+    ('CB40 Extra', '1XR Ant Service', 0),
+    ('CB40 Extra', '1XR Rodents Service', 0),
+    ('CB40 Extra', '1XR Rodents Limited Warranty Service', 0),
+    ('CB40 Extra', '1XR Roaches Service', 0),
+    ('CB40 Extra', '1XR Perimeter & Spider Service', 0),
+    ('CB40 Extra', '1XR Fall Invaders Service', 0),
+    ('CB40 Extra', '1XR Perimeter Service', 0),
+    ('CB40 Extra', '1XR Filth Flies Service', 0),
+    ('CB40 Extra', '1XR Small Flies Service', 0),
+    ('CB40 Extra', '1XR Small Flies Services', 0),
+    ('CB40 Extra', '1XR Interior Flea Service', 0),
+    ('CB40 Extra', '1XR Stored Product Pest Service', 0),
+
+    -- CB80 Extra (all FALSE)
+    ('CB80 Extra', 'Premier Home', 0),
+    ('CB80 Extra', 'Premier Perimeter', 0),
+    ('CB80 Extra', 'Premier Fall Invaders', 0),
+    ('CB80 Extra', 'Premier Ants', 0),
+    ('CB80 Extra', 'Premier Spiders', 0),
+    ('CB80 Extra', 'Premier Rodents', 0),
+    ('CB80 Extra', 'Premier Vector Ext.', 0),
+    ('CB80 Extra', 'Premier Vector-Early Fall', 0),
+    ('CB80 Extra', 'Premier Vector-Early Spring', 0),
+    ('CB80 Extra', 'Premier Vector-Early Summer', 0),
+    ('CB80 Extra', 'Premier Vector-Late Fall', 0),
+    ('CB80 Extra', 'Premier Vector-Late Spring', 0),
+    ('CB80 Extra', 'Premier Vector-Mid Summer', 0),
+    ('CB80 Extra', 'Prevention Ornamental Ext.', 0),
+    ('CB80 Extra', 'Prevention Plus', 0),
+    ('CB80 Extra', 'Prevention Pro', 0),
+    ('CB80 Extra', 'Prevention Paramount Certified', 0),
+    ('CB80 Extra', '1XR Ant Service', 0),
+    ('CB80 Extra', '1XR Rodents Service', 0),
+    ('CB80 Extra', '1XR Rodents Limited Warranty Service', 0),
+    ('CB80 Extra', '1XR Roaches Service', 0),
+    ('CB80 Extra', '1XR Perimeter & Spider Service', 0),
+    ('CB80 Extra', '1XR Fall Invaders Service', 0),
+    ('CB80 Extra', '1XR Perimeter Service', 0),
+    ('CB80 Extra', '1XR Filth Flies Service', 0),
+    ('CB80 Extra', '1XR Small Flies Service', 0),
+    ('CB80 Extra', '1XR Small Flies Services', 0),
+    ('CB80 Extra', '1XR Interior Flea Service', 0),
+    ('CB80 Extra', '1XR Stored Product Pest Service', 0),
+
+    -- Intruder HPX (all FALSE)
+    ('Intruder HPX', 'Premier Home', 0),
+    ('Intruder HPX', 'Premier Perimeter', 0),
+    ('Intruder HPX', 'Premier Fall Invaders', 0),
+    ('Intruder HPX', 'Premier Ants', 0),
+    ('Intruder HPX', 'Premier Spiders', 0),
+    ('Intruder HPX', 'Premier Rodents', 0),
+    ('Intruder HPX', 'Premier Vector Ext.', 0),
+    ('Intruder HPX', 'Premier Vector-Early Fall', 0),
+    ('Intruder HPX', 'Premier Vector-Early Spring', 0),
+    ('Intruder HPX', 'Premier Vector-Early Summer', 0),
+    ('Intruder HPX', 'Premier Vector-Late Fall', 0),
+    ('Intruder HPX', 'Premier Vector-Late Spring', 0),
+    ('Intruder HPX', 'Premier Vector-Mid Summer', 0),
+    ('Intruder HPX', 'Prevention Ornamental Ext.', 0),
+    ('Intruder HPX', 'Prevention Plus', 0),
+    ('Intruder HPX', 'Prevention Pro', 0),
+    ('Intruder HPX', 'Prevention Paramount Certified', 0),
+    ('Intruder HPX', '1XR Ant Service', 0),
+    ('Intruder HPX', '1XR Rodents Service', 0),
+    ('Intruder HPX', '1XR Rodents Limited Warranty Service', 0),
+    ('Intruder HPX', '1XR Roaches Service', 0),
+    ('Intruder HPX', '1XR Perimeter & Spider Service', 0),
+    ('Intruder HPX', '1XR Fall Invaders Service', 0),
+    ('Intruder HPX', '1XR Perimeter Service', 0),
+    ('Intruder HPX', '1XR Filth Flies Service', 0),
+    ('Intruder HPX', '1XR Small Flies Service', 0),
+    ('Intruder HPX', '1XR Small Flies Services', 0),
+    ('Intruder HPX', '1XR Interior Flea Service', 0),
+    ('Intruder HPX', '1XR Stored Product Pest Service', 0),
+
+    -- Invader HPX (all FALSE)
+    ('Invader HPX', 'Premier Home', 0),
+    ('Invader HPX', 'Premier Perimeter', 0),
+    ('Invader HPX', 'Premier Fall Invaders', 0),
+    ('Invader HPX', 'Premier Ants', 0),
+    ('Invader HPX', 'Premier Spiders', 0),
+    ('Invader HPX', 'Premier Rodents', 0),
+    ('Invader HPX', 'Premier Vector Ext.', 0),
+    ('Invader HPX', 'Premier Vector-Early Fall', 0),
+    ('Invader HPX', 'Premier Vector-Early Spring', 0),
+    ('Invader HPX', 'Premier Vector-Early Summer', 0),
+    ('Invader HPX', 'Premier Vector-Late Fall', 0),
+    ('Invader HPX', 'Premier Vector-Late Spring', 0),
+    ('Invader HPX', 'Premier Vector-Mid Summer', 0),
+    ('Invader HPX', 'Prevention Ornamental Ext.', 0),
+    ('Invader HPX', 'Prevention Plus', 0),
+    ('Invader HPX', 'Prevention Pro', 0),
+    ('Invader HPX', 'Prevention Paramount Certified', 0),
+    ('Invader HPX', '1XR Ant Service', 0),
+    ('Invader HPX', '1XR Rodents Service', 0),
+    ('Invader HPX', '1XR Rodents Limited Warranty Service', 0),
+    ('Invader HPX', '1XR Roaches Service', 0),
+    ('Invader HPX', '1XR Perimeter & Spider Service', 0),
+    ('Invader HPX', '1XR Fall Invaders Service', 0),
+    ('Invader HPX', '1XR Perimeter Service', 0),
+    ('Invader HPX', '1XR Filth Flies Service', 0),
+    ('Invader HPX', '1XR Small Flies Service', 0),
+    ('Invader HPX', '1XR Small Flies Services', 0),
+    ('Invader HPX', '1XR Interior Flea Service', 0),
+    ('Invader HPX', '1XR Stored Product Pest Service', 0),
+
+    -- PURGE III (all FALSE)
+    ('PURGE III', 'Premier Home', 0),
+    ('PURGE III', 'Premier Perimeter', 0),
+    ('PURGE III', 'Premier Fall Invaders', 0),
+    ('PURGE III', 'Premier Ants', 0),
+    ('PURGE III', 'Premier Spiders', 0),
+    ('PURGE III', 'Premier Rodents', 0),
+    ('PURGE III', 'Premier Vector Ext.', 0),
+    ('PURGE III', 'Premier Vector-Early Fall', 0),
+    ('PURGE III', 'Premier Vector-Early Spring', 0),
+    ('PURGE III', 'Premier Vector-Early Summer', 0),
+    ('PURGE III', 'Premier Vector-Late Fall', 0),
+    ('PURGE III', 'Premier Vector-Late Spring', 0),
+    ('PURGE III', 'Premier Vector-Mid Summer', 0),
+    ('PURGE III', 'Prevention Ornamental Ext.', 0),
+    ('PURGE III', 'Prevention Plus', 0),
+    ('PURGE III', 'Prevention Pro', 0),
+    ('PURGE III', 'Prevention Paramount Certified', 0),
+    ('PURGE III', '1XR Ant Service', 0),
+    ('PURGE III', '1XR Rodents Service', 0),
+    ('PURGE III', '1XR Rodents Limited Warranty Service', 0),
+    ('PURGE III', '1XR Roaches Service', 0),
+    ('PURGE III', '1XR Perimeter & Spider Service', 0),
+    ('PURGE III', '1XR Fall Invaders Service', 0),
+    ('PURGE III', '1XR Perimeter Service', 0),
+    ('PURGE III', '1XR Filth Flies Service', 0),
+    ('PURGE III', '1XR Small Flies Service', 0),
+    ('PURGE III', '1XR Small Flies Services', 0),
+    ('PURGE III', '1XR Interior Flea Service', 0),
+    ('PURGE III', '1XR Stored Product Pest Service', 0),
+
+    -- Stryker Wasp Killer (all FALSE)
+    ('Stryker Wasp Killer', 'Premier Home', 0),
+    ('Stryker Wasp Killer', 'Premier Perimeter', 0),
+    ('Stryker Wasp Killer', 'Premier Fall Invaders', 0),
+    ('Stryker Wasp Killer', 'Premier Ants', 0),
+    ('Stryker Wasp Killer', 'Premier Spiders', 0),
+    ('Stryker Wasp Killer', 'Premier Rodents', 0),
+    ('Stryker Wasp Killer', 'Premier Vector Ext.', 0),
+    ('Stryker Wasp Killer', 'Premier Vector-Early Fall', 0),
+    ('Stryker Wasp Killer', 'Premier Vector-Early Spring', 0),
+    ('Stryker Wasp Killer', 'Premier Vector-Early Summer', 0),
+    ('Stryker Wasp Killer', 'Premier Vector-Late Fall', 0),
+    ('Stryker Wasp Killer', 'Premier Vector-Late Spring', 0),
+    ('Stryker Wasp Killer', 'Premier Vector-Mid Summer', 0),
+    ('Stryker Wasp Killer', 'Prevention Ornamental Ext.', 0),
+    ('Stryker Wasp Killer', 'Prevention Plus', 0),
+    ('Stryker Wasp Killer', 'Prevention Pro', 0),
+    ('Stryker Wasp Killer', 'Prevention Paramount Certified', 0),
+    ('Stryker Wasp Killer', '1XR Ant Service', 0),
+    ('Stryker Wasp Killer', '1XR Rodents Service', 0),
+    ('Stryker Wasp Killer', '1XR Rodents Limited Warranty Service', 0),
+    ('Stryker Wasp Killer', '1XR Roaches Service', 0),
+    ('Stryker Wasp Killer', '1XR Perimeter & Spider Service', 0),
+    ('Stryker Wasp Killer', '1XR Fall Invaders Service', 0),
+    ('Stryker Wasp Killer', '1XR Perimeter Service', 0),
+    ('Stryker Wasp Killer', '1XR Filth Flies Service', 0),
+    ('Stryker Wasp Killer', '1XR Small Flies Service', 0),
+    ('Stryker Wasp Killer', '1XR Small Flies Services', 0),
+    ('Stryker Wasp Killer', '1XR Interior Flea Service', 0),
+    ('Stryker Wasp Killer', '1XR Stored Product Pest Service', 0),
+
+    -- CB-80 (all FALSE)
+    ('CB-80', 'Premier Home', 0),
+    ('CB-80', 'Premier Perimeter', 0),
+    ('CB-80', 'Premier Fall Invaders', 0),
+    ('CB-80', 'Premier Ants', 0),
+    ('CB-80', 'Premier Spiders', 0),
+    ('CB-80', 'Premier Rodents', 0),
+    ('CB-80', 'Premier Vector Ext.', 0),
+    ('CB-80', 'Premier Vector-Early Fall', 0),
+    ('CB-80', 'Premier Vector-Early Spring', 0),
+    ('CB-80', 'Premier Vector-Early Summer', 0),
+    ('CB-80', 'Premier Vector-Late Fall', 0),
+    ('CB-80', 'Premier Vector-Late Spring', 0),
+    ('CB-80', 'Premier Vector-Mid Summer', 0),
+    ('CB-80', 'Prevention Ornamental Ext.', 0),
+    ('CB-80', 'Prevention Plus', 0),
+    ('CB-80', 'Prevention Pro', 0),
+    ('CB-80', 'Prevention Paramount Certified', 0),
+    ('CB-80', '1XR Ant Service', 0),
+    ('CB-80', '1XR Rodents Service', 0),
+    ('CB-80', '1XR Rodents Limited Warranty Service', 0),
+    ('CB-80', '1XR Roaches Service', 0),
+    ('CB-80', '1XR Perimeter & Spider Service', 0),
+    ('CB-80', '1XR Fall Invaders Service', 0),
+    ('CB-80', '1XR Perimeter Service', 0),
+    ('CB-80', '1XR Filth Flies Service', 0),
+    ('CB-80', '1XR Small Flies Service', 0),
+    ('CB-80', '1XR Small Flies Services', 0),
+    ('CB-80', '1XR Interior Flea Service', 0),
+    ('CB-80', '1XR Stored Product Pest Service', 0),
+
+    -- Crossfire Aerosol (all FALSE)
+    ('Crossfire Aerosol', 'Premier Home', 0),
+    ('Crossfire Aerosol', 'Premier Perimeter', 0),
+    ('Crossfire Aerosol', 'Premier Fall Invaders', 0),
+    ('Crossfire Aerosol', 'Premier Ants', 0),
+    ('Crossfire Aerosol', 'Premier Spiders', 0),
+    ('Crossfire Aerosol', 'Premier Rodents', 0),
+    ('Crossfire Aerosol', 'Premier Vector Ext.', 0),
+    ('Crossfire Aerosol', 'Premier Vector-Early Fall', 0),
+    ('Crossfire Aerosol', 'Premier Vector-Early Spring', 0),
+    ('Crossfire Aerosol', 'Premier Vector-Early Summer', 0),
+    ('Crossfire Aerosol', 'Premier Vector-Late Fall', 0),
+    ('Crossfire Aerosol', 'Premier Vector-Late Spring', 0),
+    ('Crossfire Aerosol', 'Premier Vector-Mid Summer', 0),
+    ('Crossfire Aerosol', 'Prevention Ornamental Ext.', 0),
+    ('Crossfire Aerosol', 'Prevention Plus', 0),
+    ('Crossfire Aerosol', 'Prevention Pro', 0),
+    ('Crossfire Aerosol', 'Prevention Paramount Certified', 0),
+    ('Crossfire Aerosol', '1XR Ant Service', 0),
+    ('Crossfire Aerosol', '1XR Rodents Service', 0),
+    ('Crossfire Aerosol', '1XR Rodents Limited Warranty Service', 0),
+    ('Crossfire Aerosol', '1XR Roaches Service', 0),
+    ('Crossfire Aerosol', '1XR Perimeter & Spider Service', 0),
+    ('Crossfire Aerosol', '1XR Fall Invaders Service', 0),
+    ('Crossfire Aerosol', '1XR Perimeter Service', 0),
+    ('Crossfire Aerosol', '1XR Filth Flies Service', 0),
+    ('Crossfire Aerosol', '1XR Small Flies Service', 0),
+    ('Crossfire Aerosol', '1XR Small Flies Services', 0),
+    ('Crossfire Aerosol', '1XR Interior Flea Service', 0),
+    ('Crossfire Aerosol', '1XR Stored Product Pest Service', 0),
+
+    -- Shockwave 1 (all FALSE)
+    ('Shockwave 1', 'Premier Home', 0),
+    ('Shockwave 1', 'Premier Perimeter', 0),
+    ('Shockwave 1', 'Premier Fall Invaders', 0),
+    ('Shockwave 1', 'Premier Ants', 0),
+    ('Shockwave 1', 'Premier Spiders', 0),
+    ('Shockwave 1', 'Premier Rodents', 0),
+    ('Shockwave 1', 'Premier Vector Ext.', 0),
+    ('Shockwave 1', 'Premier Vector-Early Fall', 0),
+    ('Shockwave 1', 'Premier Vector-Early Spring', 0),
+    ('Shockwave 1', 'Premier Vector-Early Summer', 0),
+    ('Shockwave 1', 'Premier Vector-Late Fall', 0),
+    ('Shockwave 1', 'Premier Vector-Late Spring', 0),
+    ('Shockwave 1', 'Premier Vector-Mid Summer', 0),
+    ('Shockwave 1', 'Prevention Ornamental Ext.', 0),
+    ('Shockwave 1', 'Prevention Plus', 0),
+    ('Shockwave 1', 'Prevention Pro', 0),
+    ('Shockwave 1', 'Prevention Paramount Certified', 0),
+    ('Shockwave 1', '1XR Ant Service', 0),
+    ('Shockwave 1', '1XR Rodents Service', 0),
+    ('Shockwave 1', '1XR Rodents Limited Warranty Service', 0),
+    ('Shockwave 1', '1XR Roaches Service', 0),
+    ('Shockwave 1', '1XR Perimeter & Spider Service', 0),
+    ('Shockwave 1', '1XR Fall Invaders Service', 0),
+    ('Shockwave 1', '1XR Perimeter Service', 0),
+    ('Shockwave 1', '1XR Filth Flies Service', 0),
+    ('Shockwave 1', '1XR Small Flies Service', 0),
+    ('Shockwave 1', '1XR Small Flies Services', 0),
+    ('Shockwave 1', '1XR Interior Flea Service', 0),
+    ('Shockwave 1', '1XR Stored Product Pest Service', 0),
+
+    -- SureKill LD-44T (all FALSE)
+    ('SureKill LD-44T', 'Premier Home', 0),
+    ('SureKill LD-44T', 'Premier Perimeter', 0),
+    ('SureKill LD-44T', 'Premier Fall Invaders', 0),
+    ('SureKill LD-44T', 'Premier Ants', 0),
+    ('SureKill LD-44T', 'Premier Spiders', 0),
+    ('SureKill LD-44T', 'Premier Rodents', 0),
+    ('SureKill LD-44T', 'Premier Vector Ext.', 0),
+    ('SureKill LD-44T', 'Premier Vector-Early Fall', 0),
+    ('SureKill LD-44T', 'Premier Vector-Early Spring', 0),
+    ('SureKill LD-44T', 'Premier Vector-Early Summer', 0),
+    ('SureKill LD-44T', 'Premier Vector-Late Fall', 0),
+    ('SureKill LD-44T', 'Premier Vector-Late Spring', 0),
+    ('SureKill LD-44T', 'Premier Vector-Mid Summer', 0),
+    ('SureKill LD-44T', 'Prevention Ornamental Ext.', 0),
+    ('SureKill LD-44T', 'Prevention Plus', 0),
+    ('SureKill LD-44T', 'Prevention Pro', 0),
+    ('SureKill LD-44T', 'Prevention Paramount Certified', 0),
+    ('SureKill LD-44T', '1XR Ant Service', 0),
+    ('SureKill LD-44T', '1XR Rodents Service', 0),
+    ('SureKill LD-44T', '1XR Rodents Limited Warranty Service', 0),
+    ('SureKill LD-44T', '1XR Roaches Service', 0),
+    ('SureKill LD-44T', '1XR Perimeter & Spider Service', 0),
+    ('SureKill LD-44T', '1XR Fall Invaders Service', 0),
+    ('SureKill LD-44T', '1XR Perimeter Service', 0),
+    ('SureKill LD-44T', '1XR Filth Flies Service', 0),
+    ('SureKill LD-44T', '1XR Small Flies Service', 0),
+    ('SureKill LD-44T', '1XR Small Flies Services', 0),
+    ('SureKill LD-44T', '1XR Interior Flea Service', 0),
+    ('SureKill LD-44T', '1XR Stored Product Pest Service', 0),
+
+    -- CyKick CS Pressurized (all FALSE)
+    ('CyKick CS Pressurized', 'Premier Home', 0),
+    ('CyKick CS Pressurized', 'Premier Perimeter', 0),
+    ('CyKick CS Pressurized', 'Premier Fall Invaders', 0),
+    ('CyKick CS Pressurized', 'Premier Ants', 0),
+    ('CyKick CS Pressurized', 'Premier Spiders', 0),
+    ('CyKick CS Pressurized', 'Premier Rodents', 0),
+    ('CyKick CS Pressurized', 'Premier Vector Ext.', 0),
+    ('CyKick CS Pressurized', 'Premier Vector-Early Fall', 0),
+    ('CyKick CS Pressurized', 'Premier Vector-Early Spring', 0),
+    ('CyKick CS Pressurized', 'Premier Vector-Early Summer', 0),
+    ('CyKick CS Pressurized', 'Premier Vector-Late Fall', 0),
+    ('CyKick CS Pressurized', 'Premier Vector-Late Spring', 0),
+    ('CyKick CS Pressurized', 'Premier Vector-Mid Summer', 0),
+    ('CyKick CS Pressurized', 'Prevention Ornamental Ext.', 0),
+    ('CyKick CS Pressurized', 'Prevention Plus', 0),
+    ('CyKick CS Pressurized', 'Prevention Pro', 0),
+    ('CyKick CS Pressurized', 'Prevention Paramount Certified', 0),
+    ('CyKick CS Pressurized', '1XR Ant Service', 0),
+    ('CyKick CS Pressurized', '1XR Rodents Service', 0),
+    ('CyKick CS Pressurized', '1XR Rodents Limited Warranty Service', 0),
+    ('CyKick CS Pressurized', '1XR Roaches Service', 0),
+    ('CyKick CS Pressurized', '1XR Perimeter & Spider Service', 0),
+    ('CyKick CS Pressurized', '1XR Fall Invaders Service', 0),
+    ('CyKick CS Pressurized', '1XR Perimeter Service', 0),
+    ('CyKick CS Pressurized', '1XR Filth Flies Service', 0),
+    ('CyKick CS Pressurized', '1XR Small Flies Service', 0),
+    ('CyKick CS Pressurized', '1XR Small Flies Services', 0),
+    ('CyKick CS Pressurized', '1XR Interior Flea Service', 0),
+    ('CyKick CS Pressurized', '1XR Stored Product Pest Service', 0),
+
+    -- Alpine Pressurized Insecticide (all FALSE)
+    ('Alpine Pressurized Insecticide', 'Premier Home', 0),
+    ('Alpine Pressurized Insecticide', 'Premier Perimeter', 0),
+    ('Alpine Pressurized Insecticide', 'Premier Fall Invaders', 0),
+    ('Alpine Pressurized Insecticide', 'Premier Ants', 0),
+    ('Alpine Pressurized Insecticide', 'Premier Spiders', 0),
+    ('Alpine Pressurized Insecticide', 'Premier Rodents', 0),
+    ('Alpine Pressurized Insecticide', 'Premier Vector Ext.', 0),
+    ('Alpine Pressurized Insecticide', 'Premier Vector-Early Fall', 0),
+    ('Alpine Pressurized Insecticide', 'Premier Vector-Early Spring', 0),
+    ('Alpine Pressurized Insecticide', 'Premier Vector-Early Summer', 0),
+    ('Alpine Pressurized Insecticide', 'Premier Vector-Late Fall', 0),
+    ('Alpine Pressurized Insecticide', 'Premier Vector-Late Spring', 0),
+    ('Alpine Pressurized Insecticide', 'Premier Vector-Mid Summer', 0),
+    ('Alpine Pressurized Insecticide', 'Prevention Ornamental Ext.', 0),
+    ('Alpine Pressurized Insecticide', 'Prevention Plus', 0),
+    ('Alpine Pressurized Insecticide', 'Prevention Pro', 0),
+    ('Alpine Pressurized Insecticide', 'Prevention Paramount Certified', 0),
+    ('Alpine Pressurized Insecticide', '1XR Ant Service', 0),
+    ('Alpine Pressurized Insecticide', '1XR Rodents Service', 0),
+    ('Alpine Pressurized Insecticide', '1XR Rodents Limited Warranty Service', 0),
+    ('Alpine Pressurized Insecticide', '1XR Roaches Service', 0),
+    ('Alpine Pressurized Insecticide', '1XR Perimeter & Spider Service', 0),
+    ('Alpine Pressurized Insecticide', '1XR Fall Invaders Service', 0),
+    ('Alpine Pressurized Insecticide', '1XR Perimeter Service', 0),
+    ('Alpine Pressurized Insecticide', '1XR Filth Flies Service', 0),
+    ('Alpine Pressurized Insecticide', '1XR Small Flies Service', 0),
+    ('Alpine Pressurized Insecticide', '1XR Small Flies Services', 0),
+    ('Alpine Pressurized Insecticide', '1XR Interior Flea Service', 0),
+    ('Alpine Pressurized Insecticide', '1XR Stored Product Pest Service', 0),
+
+    -- PT 515 Wasp Freeze (all FALSE)
+    ('PT 515 Wasp Freeze', 'Premier Home', 0),
+    ('PT 515 Wasp Freeze', 'Premier Perimeter', 0),
+    ('PT 515 Wasp Freeze', 'Premier Fall Invaders', 0),
+    ('PT 515 Wasp Freeze', 'Premier Ants', 0),
+    ('PT 515 Wasp Freeze', 'Premier Spiders', 0),
+    ('PT 515 Wasp Freeze', 'Premier Rodents', 0),
+    ('PT 515 Wasp Freeze', 'Premier Vector Ext.', 0),
+    ('PT 515 Wasp Freeze', 'Premier Vector-Early Fall', 0),
+    ('PT 515 Wasp Freeze', 'Premier Vector-Early Spring', 0),
+    ('PT 515 Wasp Freeze', 'Premier Vector-Early Summer', 0),
+    ('PT 515 Wasp Freeze', 'Premier Vector-Late Fall', 0),
+    ('PT 515 Wasp Freeze', 'Premier Vector-Late Spring', 0),
+    ('PT 515 Wasp Freeze', 'Premier Vector-Mid Summer', 0),
+    ('PT 515 Wasp Freeze', 'Prevention Ornamental Ext.', 0),
+    ('PT 515 Wasp Freeze', 'Prevention Plus', 0),
+    ('PT 515 Wasp Freeze', 'Prevention Pro', 0),
+    ('PT 515 Wasp Freeze', 'Prevention Paramount Certified', 0),
+    ('PT 515 Wasp Freeze', '1XR Ant Service', 0),
+    ('PT 515 Wasp Freeze', '1XR Rodents Service', 0),
+    ('PT 515 Wasp Freeze', '1XR Rodents Limited Warranty Service', 0),
+    ('PT 515 Wasp Freeze', '1XR Roaches Service', 0),
+    ('PT 515 Wasp Freeze', '1XR Perimeter & Spider Service', 0),
+    ('PT 515 Wasp Freeze', '1XR Fall Invaders Service', 0),
+    ('PT 515 Wasp Freeze', '1XR Perimeter Service', 0),
+    ('PT 515 Wasp Freeze', '1XR Filth Flies Service', 0),
+    ('PT 515 Wasp Freeze', '1XR Small Flies Service', 0),
+    ('PT 515 Wasp Freeze', '1XR Small Flies Services', 0),
+    ('PT 515 Wasp Freeze', '1XR Interior Flea Service', 0),
+    ('PT 515 Wasp Freeze', '1XR Stored Product Pest Service', 0),
+
+    -- Pro-Control (all FALSE)
+    ('Pro-Control', 'Premier Home', 0),
+    ('Pro-Control', 'Premier Perimeter', 0),
+    ('Pro-Control', 'Premier Fall Invaders', 0),
+    ('Pro-Control', 'Premier Ants', 0),
+    ('Pro-Control', 'Premier Spiders', 0),
+    ('Pro-Control', 'Premier Rodents', 0),
+    ('Pro-Control', 'Premier Vector Ext.', 0),
+    ('Pro-Control', 'Premier Vector-Early Fall', 0),
+    ('Pro-Control', 'Premier Vector-Early Spring', 0),
+    ('Pro-Control', 'Premier Vector-Early Summer', 0),
+    ('Pro-Control', 'Premier Vector-Late Fall', 0),
+    ('Pro-Control', 'Premier Vector-Late Spring', 0),
+    ('Pro-Control', 'Premier Vector-Mid Summer', 0),
+    ('Pro-Control', 'Prevention Ornamental Ext.', 0),
+    ('Pro-Control', 'Prevention Plus', 0),
+    ('Pro-Control', 'Prevention Pro', 0),
+    ('Pro-Control', 'Prevention Paramount Certified', 0),
+    ('Pro-Control', '1XR Ant Service', 0),
+    ('Pro-Control', '1XR Rodents Service', 0),
+    ('Pro-Control', '1XR Rodents Limited Warranty Service', 0),
+    ('Pro-Control', '1XR Roaches Service', 0),
+    ('Pro-Control', '1XR Perimeter & Spider Service', 0),
+    ('Pro-Control', '1XR Fall Invaders Service', 0),
+    ('Pro-Control', '1XR Perimeter Service', 0),
+    ('Pro-Control', '1XR Filth Flies Service', 0),
+    ('Pro-Control', '1XR Small Flies Service', 0),
+    ('Pro-Control', '1XR Small Flies Services', 0),
+    ('Pro-Control', '1XR Interior Flea Service', 0),
+    ('Pro-Control', '1XR Stored Product Pest Service', 0),
+
+    -- Gentrol Complete (all FALSE)
+    ('Gentrol Complete', 'Premier Home', 0),
+    ('Gentrol Complete', 'Premier Perimeter', 0),
+    ('Gentrol Complete', 'Premier Fall Invaders', 0),
+    ('Gentrol Complete', 'Premier Ants', 0),
+    ('Gentrol Complete', 'Premier Spiders', 0),
+    ('Gentrol Complete', 'Premier Rodents', 0),
+    ('Gentrol Complete', 'Premier Vector Ext.', 0),
+    ('Gentrol Complete', 'Premier Vector-Early Fall', 0),
+    ('Gentrol Complete', 'Premier Vector-Early Spring', 0),
+    ('Gentrol Complete', 'Premier Vector-Early Summer', 0),
+    ('Gentrol Complete', 'Premier Vector-Late Fall', 0),
+    ('Gentrol Complete', 'Premier Vector-Late Spring', 0),
+    ('Gentrol Complete', 'Premier Vector-Mid Summer', 0),
+    ('Gentrol Complete', 'Prevention Ornamental Ext.', 0),
+    ('Gentrol Complete', 'Prevention Plus', 0),
+    ('Gentrol Complete', 'Prevention Pro', 0),
+    ('Gentrol Complete', 'Prevention Paramount Certified', 0),
+    ('Gentrol Complete', '1XR Ant Service', 0),
+    ('Gentrol Complete', '1XR Rodents Service', 0),
+    ('Gentrol Complete', '1XR Rodents Limited Warranty Service', 0),
+    ('Gentrol Complete', '1XR Roaches Service', 0),
+    ('Gentrol Complete', '1XR Perimeter & Spider Service', 0),
+    ('Gentrol Complete', '1XR Fall Invaders Service', 0),
+    ('Gentrol Complete', '1XR Perimeter Service', 0),
+    ('Gentrol Complete', '1XR Filth Flies Service', 0),
+    ('Gentrol Complete', '1XR Small Flies Service', 0),
+    ('Gentrol Complete', '1XR Small Flies Services', 0),
+    ('Gentrol Complete', '1XR Interior Flea Service', 0),
+    ('Gentrol Complete', '1XR Stored Product Pest Service', 0),
+
+    -- Zenprox Xtend (all FALSE)
+    ('Zenprox Xtend', 'Premier Home', 0),
+    ('Zenprox Xtend', 'Premier Perimeter', 0),
+    ('Zenprox Xtend', 'Premier Fall Invaders', 0),
+    ('Zenprox Xtend', 'Premier Ants', 0),
+    ('Zenprox Xtend', 'Premier Spiders', 0),
+    ('Zenprox Xtend', 'Premier Rodents', 0),
+    ('Zenprox Xtend', 'Premier Vector Ext.', 0),
+    ('Zenprox Xtend', 'Premier Vector-Early Fall', 0),
+    ('Zenprox Xtend', 'Premier Vector-Early Spring', 0),
+    ('Zenprox Xtend', 'Premier Vector-Early Summer', 0),
+    ('Zenprox Xtend', 'Premier Vector-Late Fall', 0),
+    ('Zenprox Xtend', 'Premier Vector-Late Spring', 0),
+    ('Zenprox Xtend', 'Premier Vector-Mid Summer', 0),
+    ('Zenprox Xtend', 'Prevention Ornamental Ext.', 0),
+    ('Zenprox Xtend', 'Prevention Plus', 0),
+    ('Zenprox Xtend', 'Prevention Pro', 0),
+    ('Zenprox Xtend', 'Prevention Paramount Certified', 0),
+    ('Zenprox Xtend', '1XR Ant Service', 0),
+    ('Zenprox Xtend', '1XR Rodents Service', 0),
+    ('Zenprox Xtend', '1XR Rodents Limited Warranty Service', 0),
+    ('Zenprox Xtend', '1XR Roaches Service', 0),
+    ('Zenprox Xtend', '1XR Perimeter & Spider Service', 0),
+    ('Zenprox Xtend', '1XR Fall Invaders Service', 0),
+    ('Zenprox Xtend', '1XR Perimeter Service', 0),
+    ('Zenprox Xtend', '1XR Filth Flies Service', 0),
+    ('Zenprox Xtend', '1XR Small Flies Service', 0),
+    ('Zenprox Xtend', '1XR Small Flies Services', 0),
+    ('Zenprox Xtend', '1XR Interior Flea Service', 0),
+    ('Zenprox Xtend', '1XR Stored Product Pest Service', 0),
+
+    -- AIR SPONGE (all FALSE)
+    ('AIR SPONGE', 'Premier Home', 0),
+    ('AIR SPONGE', 'Premier Perimeter', 0),
+    ('AIR SPONGE', 'Premier Fall Invaders', 0),
+    ('AIR SPONGE', 'Premier Ants', 0),
+    ('AIR SPONGE', 'Premier Spiders', 0),
+    ('AIR SPONGE', 'Premier Rodents', 0),
+    ('AIR SPONGE', 'Premier Vector Ext.', 0),
+    ('AIR SPONGE', 'Premier Vector-Early Fall', 0),
+    ('AIR SPONGE', 'Premier Vector-Early Spring', 0),
+    ('AIR SPONGE', 'Premier Vector-Early Summer', 0),
+    ('AIR SPONGE', 'Premier Vector-Late Fall', 0),
+    ('AIR SPONGE', 'Premier Vector-Late Spring', 0),
+    ('AIR SPONGE', 'Premier Vector-Mid Summer', 0),
+    ('AIR SPONGE', 'Prevention Ornamental Ext.', 0),
+    ('AIR SPONGE', 'Prevention Plus', 0),
+    ('AIR SPONGE', 'Prevention Pro', 0),
+    ('AIR SPONGE', 'Prevention Paramount Certified', 0),
+    ('AIR SPONGE', '1XR Ant Service', 0),
+    ('AIR SPONGE', '1XR Rodents Service', 0),
+    ('AIR SPONGE', '1XR Rodents Limited Warranty Service', 0),
+    ('AIR SPONGE', '1XR Roaches Service', 0),
+    ('AIR SPONGE', '1XR Perimeter & Spider Service', 0),
+    ('AIR SPONGE', '1XR Fall Invaders Service', 0),
+    ('AIR SPONGE', '1XR Perimeter Service', 0),
+    ('AIR SPONGE', '1XR Filth Flies Service', 0),
+    ('AIR SPONGE', '1XR Small Flies Service', 0),
+    ('AIR SPONGE', '1XR Small Flies Services', 0),
+    ('AIR SPONGE', '1XR Interior Flea Service', 0),
+    ('AIR SPONGE', '1XR Stored Product Pest Service', 0),
+
+    -- Air Freshener Tub (all FALSE)
+    ('Air Freshener Tub', 'Premier Home', 0),
+    ('Air Freshener Tub', 'Premier Perimeter', 0),
+    ('Air Freshener Tub', 'Premier Fall Invaders', 0),
+    ('Air Freshener Tub', 'Premier Ants', 0),
+    ('Air Freshener Tub', 'Premier Spiders', 0),
+    ('Air Freshener Tub', 'Premier Rodents', 0),
+    ('Air Freshener Tub', 'Premier Vector Ext.', 0),
+    ('Air Freshener Tub', 'Premier Vector-Early Fall', 0),
+    ('Air Freshener Tub', 'Premier Vector-Early Spring', 0),
+    ('Air Freshener Tub', 'Premier Vector-Early Summer', 0),
+    ('Air Freshener Tub', 'Premier Vector-Late Fall', 0),
+    ('Air Freshener Tub', 'Premier Vector-Late Spring', 0),
+    ('Air Freshener Tub', 'Premier Vector-Mid Summer', 0),
+    ('Air Freshener Tub', 'Prevention Ornamental Ext.', 0),
+    ('Air Freshener Tub', 'Prevention Plus', 0),
+    ('Air Freshener Tub', 'Prevention Pro', 0),
+    ('Air Freshener Tub', 'Prevention Paramount Certified', 0),
+    ('Air Freshener Tub', '1XR Ant Service', 0),
+    ('Air Freshener Tub', '1XR Rodents Service', 0),
+    ('Air Freshener Tub', '1XR Rodents Limited Warranty Service', 0),
+    ('Air Freshener Tub', '1XR Roaches Service', 0),
+    ('Air Freshener Tub', '1XR Perimeter & Spider Service', 0),
+    ('Air Freshener Tub', '1XR Fall Invaders Service', 0),
+    ('Air Freshener Tub', '1XR Perimeter Service', 0),
+    ('Air Freshener Tub', '1XR Filth Flies Service', 0),
+    ('Air Freshener Tub', '1XR Small Flies Service', 0),
+    ('Air Freshener Tub', '1XR Small Flies Services', 0),
+    ('Air Freshener Tub', '1XR Interior Flea Service', 0),
+    ('Air Freshener Tub', '1XR Stored Product Pest Service', 0),
+
+    -- Fragrance (all FALSE)
+    ('Fragrance', 'Premier Home', 0),
+    ('Fragrance', 'Premier Perimeter', 0),
+    ('Fragrance', 'Premier Fall Invaders', 0),
+    ('Fragrance', 'Premier Ants', 0),
+    ('Fragrance', 'Premier Spiders', 0),
+    ('Fragrance', 'Premier Rodents', 0),
+    ('Fragrance', 'Premier Vector Ext.', 0),
+    ('Fragrance', 'Premier Vector-Early Fall', 0),
+    ('Fragrance', 'Premier Vector-Early Spring', 0),
+    ('Fragrance', 'Premier Vector-Early Summer', 0),
+    ('Fragrance', 'Premier Vector-Late Fall', 0),
+    ('Fragrance', 'Premier Vector-Late Spring', 0),
+    ('Fragrance', 'Premier Vector-Mid Summer', 0),
+    ('Fragrance', 'Prevention Ornamental Ext.', 0),
+    ('Fragrance', 'Prevention Plus', 0),
+    ('Fragrance', 'Prevention Pro', 0),
+    ('Fragrance', 'Prevention Paramount Certified', 0),
+    ('Fragrance', '1XR Ant Service', 0),
+    ('Fragrance', '1XR Rodents Service', 0),
+    ('Fragrance', '1XR Rodents Limited Warranty Service', 0),
+    ('Fragrance', '1XR Roaches Service', 0),
+    ('Fragrance', '1XR Perimeter & Spider Service', 0),
+    ('Fragrance', '1XR Fall Invaders Service', 0),
+    ('Fragrance', '1XR Perimeter Service', 0),
+    ('Fragrance', '1XR Filth Flies Service', 0),
+    ('Fragrance', '1XR Small Flies Service', 0),
+    ('Fragrance', '1XR Small Flies Services', 0),
+    ('Fragrance', '1XR Interior Flea Service', 0),
+    ('Fragrance', '1XR Stored Product Pest Service', 0),
+
+    -- TimeMist (all FALSE)
+    ('TimeMist', 'Premier Home', 0),
+    ('TimeMist', 'Premier Perimeter', 0),
+    ('TimeMist', 'Premier Fall Invaders', 0),
+    ('TimeMist', 'Premier Ants', 0),
+    ('TimeMist', 'Premier Spiders', 0),
+    ('TimeMist', 'Premier Rodents', 0),
+    ('TimeMist', 'Premier Vector Ext.', 0),
+    ('TimeMist', 'Premier Vector-Early Fall', 0),
+    ('TimeMist', 'Premier Vector-Early Spring', 0),
+    ('TimeMist', 'Premier Vector-Early Summer', 0),
+    ('TimeMist', 'Premier Vector-Late Fall', 0),
+    ('TimeMist', 'Premier Vector-Late Spring', 0),
+    ('TimeMist', 'Premier Vector-Mid Summer', 0),
+    ('TimeMist', 'Prevention Ornamental Ext.', 0),
+    ('TimeMist', 'Prevention Plus', 0),
+    ('TimeMist', 'Prevention Pro', 0),
+    ('TimeMist', 'Prevention Paramount Certified', 0),
+    ('TimeMist', '1XR Ant Service', 0),
+    ('TimeMist', '1XR Rodents Service', 0),
+    ('TimeMist', '1XR Rodents Limited Warranty Service', 0),
+    ('TimeMist', '1XR Roaches Service', 0),
+    ('TimeMist', '1XR Perimeter & Spider Service', 0),
+    ('TimeMist', '1XR Fall Invaders Service', 0),
+    ('TimeMist', '1XR Perimeter Service', 0),
+    ('TimeMist', '1XR Filth Flies Service', 0),
+    ('TimeMist', '1XR Small Flies Service', 0),
+    ('TimeMist', '1XR Small Flies Services', 0),
+    ('TimeMist', '1XR Interior Flea Service', 0),
+    ('TimeMist', '1XR Stored Product Pest Service', 0);
+
+-- ====================================================================
+-- QUERY 1: DETAILED VIOLATIONS
+-- ====================================================================
+SELECT
+    v.[location_key],
+    v.[location_name],
+    v.[service_order_key],
+    v.[service_description],
+    v.[work_dt],
+    v.[technician_name],
+    v.[quantity_used],
+    v.[item_description],
+    'Product not approved for this service' as violation_type
+FROM [dbo].[vr_2067] v
+INNER JOIN @ProductServiceMatrix m
+    ON v.[item_description] = m.product_name
+    AND v.[service_description] = m.service_name
+    AND m.is_valid = 0
+WHERE v.[work_dt] >= DATEADD(day, -7, CAST(GETDATE() AS date))
+    AND v.[work_dt] < CAST(GETDATE() AS date)
+ORDER BY v.[work_dt] DESC, v.[location_name];
+
+-- ====================================================================
+-- QUERY 2: ERROR PERCENTAGE BY TECHNICIAN
+-- ====================================================================
+SELECT
+    tt.technician_name,
+    ISNULL(te.error_count, 0) as error_count,
+    tt.total_product_uses,
+    CAST(ISNULL(te.error_count, 0) * 1.0 / NULLIF(tt.total_product_uses, 0) AS DECIMAL(6,5)) as error_percentage
+FROM (
+    SELECT
+        technician_name,
+        COUNT(*) as total_product_uses,
+        SUM(CAST(quantity_used AS INT)) as total_quantity_used
+    FROM [dbo].[vr_2067]
+    WHERE work_dt >= DATEADD(day, -7, CAST(GETDATE() AS date))
+        AND work_dt < CAST(GETDATE() AS date)
+    GROUP BY technician_name
+) tt
+LEFT JOIN (
+    SELECT
+        v.technician_name,
+        COUNT(*) as error_count
+    FROM [dbo].[vr_2067] v
+    INNER JOIN @ProductServiceMatrix m
+        ON v.[item_description] = m.product_name
+        AND v.[service_description] = m.service_name
+        AND m.is_valid = 0
+    WHERE v.work_dt >= DATEADD(day, -7, CAST(GETDATE() AS date))
+        AND v.work_dt < CAST(GETDATE() AS date)
+    GROUP BY v.technician_name
+) te ON tt.technician_name = te.technician_name
+ORDER BY error_percentage DESC;
+
+-- ====================================================================
+-- QUERY 3: OVERALL ERROR PERCENTAGE
+-- ====================================================================
+SELECT
+    (SELECT COUNT(*) FROM [dbo].[vr_2067] v
+     INNER JOIN @ProductServiceMatrix m ON v.[item_description] = m.product_name
+         AND v.[service_description] = m.service_name AND m.is_valid = 0
+     WHERE v.work_dt >= DATEADD(day, -7, CAST(GETDATE() AS date))
+         AND v.work_dt < CAST(GETDATE() AS date)) as total_errors,
+
+    (SELECT COUNT(*) FROM [dbo].[vr_2067]
+     WHERE work_dt >= DATEADD(day, -7, CAST(GETDATE() AS date))
+         AND work_dt < CAST(GETDATE() AS date)) as total_uses,
+
+    CAST((SELECT COUNT(*) FROM [dbo].[vr_2067] v
+          INNER JOIN @ProductServiceMatrix m ON v.[item_description] = m.product_name
+              AND v.[service_description] = m.service_name AND m.is_valid = 0
+          WHERE v.work_dt >= DATEADD(day, -7, CAST(GETDATE() AS date))
+              AND v.work_dt < CAST(GETDATE() AS date)) * 100.0 /
+         NULLIF((SELECT COUNT(*) FROM [dbo].[vr_2067]
+                 WHERE work_dt >= DATEADD(day, -7, CAST(GETDATE() AS date))
+                     AND work_dt < CAST(GETDATE() AS date)), 0) AS DECIMAL(5,2)) as overall_error_percentage;
+
+-- ====================================================================
+-- QUERY 4: QUANTITY OF ERRORS BY PRODUCT TYPE
+-- ====================================================================
+SELECT
+    v.item_description as product_name,
+    COUNT(*) as error_count
+FROM [dbo].[vr_2067] v
+INNER JOIN @ProductServiceMatrix m
+    ON v.[item_description] = m.product_name
+    AND v.[service_description] = m.service_name
+    AND m.is_valid = 0
+WHERE v.work_dt >= DATEADD(day, -7, CAST(GETDATE() AS date))
+    AND v.work_dt < CAST(GETDATE() AS date)
+GROUP BY v.item_description
+ORDER BY error_count DESC;
