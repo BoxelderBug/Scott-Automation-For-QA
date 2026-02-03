@@ -806,7 +806,7 @@ INNER JOIN @ProductServiceMatrix m
     ON v.[item_description] = m.product_name
     AND v.[service_description] = m.service_name
     AND m.is_valid = 0
-WHERE v.[work_dt] >= DATEADD(day, -7, CAST(GETDATE() AS date))
+WHERE v.[work_dt] >= DATEADD(day, -30, CAST(GETDATE() AS date))
     AND v.[work_dt] < CAST(GETDATE() AS date)
 ORDER BY v.[work_dt] DESC, v.[location_name];
 
@@ -824,7 +824,7 @@ FROM (
         COUNT(*) as total_product_uses,
         SUM(CAST(quantity_used AS INT)) as total_quantity_used
     FROM [dbo].[vr_2067]
-    WHERE work_dt >= DATEADD(day, -7, CAST(GETDATE() AS date))
+    WHERE work_dt >= DATEADD(day, -30, CAST(GETDATE() AS date))
         AND work_dt < CAST(GETDATE() AS date)
     GROUP BY technician_name
 ) tt
@@ -837,7 +837,7 @@ LEFT JOIN (
         ON v.[item_description] = m.product_name
         AND v.[service_description] = m.service_name
         AND m.is_valid = 0
-    WHERE v.work_dt >= DATEADD(day, -7, CAST(GETDATE() AS date))
+    WHERE v.work_dt >= DATEADD(day, -30, CAST(GETDATE() AS date))
         AND v.work_dt < CAST(GETDATE() AS date)
     GROUP BY v.technician_name
 ) te ON tt.technician_name = te.technician_name
@@ -850,20 +850,20 @@ SELECT
     (SELECT COUNT(*) FROM [dbo].[vr_2067] v
      INNER JOIN @ProductServiceMatrix m ON v.[item_description] = m.product_name
          AND v.[service_description] = m.service_name AND m.is_valid = 0
-     WHERE v.work_dt >= DATEADD(day, -7, CAST(GETDATE() AS date))
+     WHERE v.work_dt >= DATEADD(day, -30, CAST(GETDATE() AS date))
          AND v.work_dt < CAST(GETDATE() AS date)) as total_errors,
 
     (SELECT COUNT(*) FROM [dbo].[vr_2067]
-     WHERE work_dt >= DATEADD(day, -7, CAST(GETDATE() AS date))
+     WHERE work_dt >= DATEADD(day, -30, CAST(GETDATE() AS date))
          AND work_dt < CAST(GETDATE() AS date)) as total_uses,
 
     CAST((SELECT COUNT(*) FROM [dbo].[vr_2067] v
           INNER JOIN @ProductServiceMatrix m ON v.[item_description] = m.product_name
               AND v.[service_description] = m.service_name AND m.is_valid = 0
-          WHERE v.work_dt >= DATEADD(day, -7, CAST(GETDATE() AS date))
+          WHERE v.work_dt >= DATEADD(day, -30, CAST(GETDATE() AS date))
               AND v.work_dt < CAST(GETDATE() AS date)) * 100.0 /
          NULLIF((SELECT COUNT(*) FROM [dbo].[vr_2067]
-                 WHERE work_dt >= DATEADD(day, -7, CAST(GETDATE() AS date))
+                 WHERE work_dt >= DATEADD(day, -30, CAST(GETDATE() AS date))
                      AND work_dt < CAST(GETDATE() AS date)), 0) AS DECIMAL(5,2)) as overall_error_percentage;
 
 -- ====================================================================
@@ -877,7 +877,7 @@ INNER JOIN @ProductServiceMatrix m
     ON v.[item_description] = m.product_name
     AND v.[service_description] = m.service_name
     AND m.is_valid = 0
-WHERE v.work_dt >= DATEADD(day, -7, CAST(GETDATE() AS date))
+WHERE v.work_dt >= DATEADD(day, -30, CAST(GETDATE() AS date))
     AND v.work_dt < CAST(GETDATE() AS date)
 GROUP BY v.item_description
 ORDER BY error_count DESC;
