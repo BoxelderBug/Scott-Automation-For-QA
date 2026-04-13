@@ -4,6 +4,11 @@
 -- Just run this entire script as one batch
 -- ====================================================================
 
+-- Last completed quarter date range (dynamically computed)
+-- @QtrStart = first day of last quarter, @QtrEnd = first day of current quarter (exclusive upper bound)
+DECLARE @QtrStart DATE = DATEADD(QUARTER, DATEDIFF(QUARTER, 0, GETDATE()) - 1, 0);
+DECLARE @QtrEnd   DATE = DATEADD(QUARTER, DATEDIFF(QUARTER, 0, GETDATE()), 0);
+
 -- Declare the table variable (exists only during this batch)
 DECLARE @ProductServiceMatrix TABLE (
     product_name VARCHAR(100),
@@ -806,8 +811,8 @@ INNER JOIN @ProductServiceMatrix m
     ON v.[item_description] = m.product_name
     AND v.[service_description] = m.service_name
     AND m.is_valid = 0
-WHERE v.[work_dt] >= DATEADD(day, -30, CAST(GETDATE() AS date))
-    AND v.[work_dt] < CAST(GETDATE() AS date)
+WHERE v.[work_dt] >= @QtrStart
+    AND v.[work_dt] < @QtrEnd
 ORDER BY v.[work_dt] DESC, v.[location_name];
 
 -- ====================================================================
@@ -824,8 +829,8 @@ FROM (
         COUNT(*) as total_product_uses,
         SUM(CAST(quantity_used AS INT)) as total_quantity_used
     FROM [dbo].[vr_2067]
-    WHERE work_dt >= DATEADD(day, -30, CAST(GETDATE() AS date))
-        AND work_dt < CAST(GETDATE() AS date)
+    WHERE work_dt >= @QtrStart
+        AND work_dt < @QtrEnd
     GROUP BY technician_name
 ) tt
 LEFT JOIN (
@@ -837,8 +842,8 @@ LEFT JOIN (
         ON v.[item_description] = m.product_name
         AND v.[service_description] = m.service_name
         AND m.is_valid = 0
-    WHERE v.work_dt >= DATEADD(day, -30, CAST(GETDATE() AS date))
-        AND v.work_dt < CAST(GETDATE() AS date)
+    WHERE v.work_dt >= @QtrStart
+        AND v.work_dt < @QtrEnd
     GROUP BY v.technician_name
 ) te ON tt.technician_name = te.technician_name
 ORDER BY error_percentage DESC;
@@ -850,21 +855,21 @@ SELECT
     (SELECT COUNT(*) FROM [dbo].[vr_2067] v
      INNER JOIN @ProductServiceMatrix m ON v.[item_description] = m.product_name
          AND v.[service_description] = m.service_name AND m.is_valid = 0
-     WHERE v.work_dt >= DATEADD(day, -30, CAST(GETDATE() AS date))
-         AND v.work_dt < CAST(GETDATE() AS date)) as total_errors,
+     WHERE v.work_dt >= @QtrStart
+         AND v.work_dt < @QtrEnd) as total_errors,
 
     (SELECT COUNT(*) FROM [dbo].[vr_2067]
-     WHERE work_dt >= DATEADD(day, -30, CAST(GETDATE() AS date))
-         AND work_dt < CAST(GETDATE() AS date)) as total_uses,
+     WHERE work_dt >= @QtrStart
+         AND work_dt < @QtrEnd) as total_uses,
 
     CAST((SELECT COUNT(*) FROM [dbo].[vr_2067] v
           INNER JOIN @ProductServiceMatrix m ON v.[item_description] = m.product_name
               AND v.[service_description] = m.service_name AND m.is_valid = 0
-          WHERE v.work_dt >= DATEADD(day, -30, CAST(GETDATE() AS date))
-              AND v.work_dt < CAST(GETDATE() AS date)) * 100.0 /
+          WHERE v.work_dt >= @QtrStart
+              AND v.work_dt < @QtrEnd) * 100.0 /
          NULLIF((SELECT COUNT(*) FROM [dbo].[vr_2067]
-                 WHERE work_dt >= DATEADD(day, -30, CAST(GETDATE() AS date))
-                     AND work_dt < CAST(GETDATE() AS date)), 0) AS DECIMAL(5,2)) as overall_error_percentage;
+                 WHERE work_dt >= @QtrStart
+                     AND work_dt < @QtrEnd), 0) AS DECIMAL(5,2)) as overall_error_percentage;
 
 -- ====================================================================
 -- QUERY 4: QUANTITY OF ERRORS BY PRODUCT TYPE
@@ -877,7 +882,7 @@ INNER JOIN @ProductServiceMatrix m
     ON v.[item_description] = m.product_name
     AND v.[service_description] = m.service_name
     AND m.is_valid = 0
-WHERE v.work_dt >= DATEADD(day, -30, CAST(GETDATE() AS date))
-    AND v.work_dt < CAST(GETDATE() AS date)
+WHERE v.work_dt >= @QtrStart
+    AND v.work_dt < @QtrEnd
 GROUP BY v.item_description
 ORDER BY error_count DESC;
